@@ -1,0 +1,109 @@
+# ───────────────────────── Xorics .gitignore ─────────────────────────
+# Track: source (*.py), apply-*.sh patch scripts, README/LICENSE, this file.
+# Ignore: venvs, model weights, generated runtime artifacts, backups, secrets.
+# NOTE: git does not support inline comments — every comment is on its own line.
+
+# ── Model weights (NEVER commit — multi-GB) ──
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.onnx
+models/
+
+# ── Python virtualenvs ──
+venv/
+.venv/
+env/
+skidl-venv/
+
+# ── Python caches / build ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Apply-script backups (timestamped *.bak-YYYYMMDD-HHMMSS) ──
+*.bak-*
+*.bak
+*.orig
+# whole-tree backup dirs created by apply scripts (backup-YYYYMMDD-HHMMSS/)
+backup-*/
+
+# ── Generated runtime state ──
+# coder notebooks (XORICS_NOTEBOOK_DIR), regenerated per run
+notebooks/
+# generated boards — keep the folder as a documented output location, ignore everything in it.
+# per-design save_circuit slugs AND top-level *_BUILT.py keepers are all output, not source.
+circuits/*
+!circuits/.gitkeep
+# firmware output (.ino) wherever save_sketch lands it
+sketches/
+*.ino
+# KiCad netlists / ERC reports emitted by check_circuit
+*.net
+*.erc
+# snapshots of in-progress designs
+wip/
+
+# ── RAG / datasheet index (generated) ──
+rag_index/
+datasheets/
+*.pdf
+index/
+.rag/
+*.faiss
+*.index
+embeddings/
+
+# ── Taildrop inbox (transient drop zone — clear before re-sending) ──
+inbox/
+
+# ── Secrets / credentials (belt-and-suspenders; none currently in source) ──
+.env
+.env.*
+*.key
+*.pem
+*_token
+*.secret
+secrets/
+tailscale.key
+
+# ── Logs ──
+*.log
+logs/
+
+# ── Proprietary / out-of-tree (keep closed code OUT of this AGPL repo) ──
+# Closed apps (e.g. Drift) must live in their OWN separate repos and must never
+# import Xorics modules — arm's-length use only. These entries are a
+# belt-and-suspenders guard in case such files ever land in this tree by mistake.
+drift/
+proprietary/
+private/
+closed/
+
+# ── One-shot ops scripts (not part of the project; may carry local identity) ──
+publish-xorics.sh
+
+# ── Stray debug / smoke-test output ──
+*-smoke-error.txt
+
+# ── Local server config (carries machine-specific paths/ports) ──
+# publish a sanitized template later if you want one in the repo
+llama-swap.yaml
+
+# ── OS / editor cruft ──
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+.cache/
