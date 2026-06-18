@@ -110,7 +110,7 @@ try:
     for _p in _xc.parts:
         _xparts.append([str(getattr(_p, "ref", "?")), str(getattr(_p, "name", "")),
                         str(getattr(_p, "lib", "")),
-                        [str(getattr(_pp, "name", "")) for _pp in _p.pins]])
+                        [[str(getattr(_pp, "num", "")), str(getattr(_pp, "name", ""))] for _pp in _p.pins]])
     print("XORICS_POWER_JSON:" + _xj.dumps({"nets": _xnets, "parts": _xparts}))
 except Exception as _xe:
     print("XORICS_POWER_ERR:" + repr(_xe))
