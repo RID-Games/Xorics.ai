@@ -1,23 +1,4 @@
 #!/usr/bin/env python3
-# Xorics — a self-hosted local AI assistant for embedded / PCB engineering.
-# Copyright (C) 2026 Zawayix
-#
-# This file is part of Xorics. Xorics is free software: you can redistribute it
-# and/or modify it under the terms of the GNU Affero General Public License as
-# published by the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Xorics is distributed in the hope that it will be useful, but WITHOUT ANY
-# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
-# A PARTICULAR PURPOSE. See the GNU Affero General Public License for details.
-#
-# You should have received a copy of the GNU Affero General Public License along
-# with Xorics. If not, see <https://www.gnu.org/licenses/>.
-#
-# ADDITIONAL PERMISSION (AGPLv3 section 7): designs and files produced by RUNNING
-# Xorics, and any fragments it embeds into that output, are NOT covered by the
-# AGPL — you may license your generated designs as you wish. See LICENSE-EXCEPTION.
-
 """
 Xorics — local AI. A generalist manager brain that DELEGATES coding to a specialist
 coder brain, swapping on a single GPU and handing back a finished sketch file.
@@ -196,8 +177,8 @@ TOOLS = [
         "description": "Find a part's datasheet PDF on the web, download it, and add it to the index. "
                        "Use ONLY when search_datasheets returns nothing, then search again.",
         "parameters": {"type": "object", "properties": {
-            "part": {"type": "string", "description": "Part number or component name."}},
-            "required": ["part"]}}},
+            "query": {"type": "string", "description": "Part number or component name."}},
+            "required": ["query"]}}},
     {"type": "function", "function": {
         "name": "compile_check",
         "description": "Compile Arduino-framework firmware (ESP32-C3) with arduino-cli; returns pass/fail, "
