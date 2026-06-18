@@ -483,6 +483,16 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
             # Capture the exact script that passed so a later edit can't overwrite the win.
             if getattr(result, "status", None) == "built":
                 built_code = args.get("code")
+                if built_code is None and args.get("path"):
+                    # check_circuit_file validates a SAVED script by PATH, so there's no inline
+                    # `code` to capture. Read the verified file back so BUILT-stop still fires —
+                    # without this a file-based BUILT never stopped the loop, and the coder
+                    # wandered off rebuilding a board that had already passed (and broke it).
+                    try:
+                        from pathlib import Path as _P
+                        built_code = _P(args["path"]).expanduser().read_text()
+                    except Exception:
+                        built_code = ""   # unreadable, but it built — still stop (below)
             elif getattr(result, "status", None) == "user_stopped":  # XORICS-FEATURE: coder-control
                 stopped_msg = str(result)        # human halted a delegated coder; do not re-delegate
         if stopped_msg is not None:
