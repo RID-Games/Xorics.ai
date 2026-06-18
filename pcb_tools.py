@@ -39,6 +39,7 @@ import subprocess
 import tempfile
 from difflib import SequenceMatcher
 from pathlib import Path
+import netlist_query as nq
 
 SKIDL_PYTHON = os.environ.get(
     "XORICS_SKIDL_PYTHON", str(Path.home() / "xorics-ai" / "skidl-venv" / "bin" / "python"))
@@ -108,65 +109,63 @@ try:
         _xnets.append([_nm, _nd])
     _xparts = []
     for _p in _xc.parts:
+        _xlib = (getattr(getattr(_p, "lib", None), "filename", "")
+                 or getattr(getattr(_p, "lib", None), "name", "") or "")
         _xparts.append([str(getattr(_p, "ref", "?")), str(getattr(_p, "name", "")),
-                        str(getattr(_p, "lib", "")),
+                        str(_xlib),
                         [[str(getattr(_pp, "num", "")), str(getattr(_pp, "name", ""))] for _pp in _p.pins]])
     print("XORICS_POWER_JSON:" + _xj.dumps({"nets": _xnets, "parts": _xparts}))
 except Exception as _xe:
     print("XORICS_POWER_ERR:" + repr(_xe))
 '''
 
-# Net/pin names that name a voltage rail without using digits.
-_KNOWN_RAILS = {"VBUS": 5.0, "VUSB": 5.0, "USB5V": 5.0}
+# The strong-grader checks below are composed from the Layer-1 netlist_query
+# primitives (one tested join, no duplicated pin-matching). netlist_query also
+# owns the voltage-token and non-electrical logic, so the fragile name-only
+# checkers that used to live here — which the [num,name] inspector shape broke —
+# are gone.
+
+def _floating_faults(data) -> list:
+    """Hard fault: a multi-pin electrical part with EVERY pin floating — placed but
+    never wired (e.g. an unconnected crystal). Unambiguous bug; fails the build."""
+    if not data:
+        return []
+    return [f"{ref} ({name}) has NONE of its {n} pins connected — it was placed but "
+            f"never wired into the circuit."
+            for ref, name, n in nq.fully_floating_parts(data)]
 
 
-def _net_voltage_tokens(name: str) -> set:
-    """Recognized nominal voltages implied by a net/pin NAME (e.g. '3V3'->3.3, 'VBUS'->5.0).
-    High precision: only well-formed rail names count, so we don't invent a domain from noise."""
-    if not name:
-        return set()
-    u = name.upper()
-    volts = set()
-    for k, v in _KNOWN_RAILS.items():
-        if k in u:
-            volts.add(v)
-    for m in re.finditer(r"(?<![A-Z0-9])(\d)V(\d)(?![0-9])", u):      # 3V3 -> 3.3, 1V8 -> 1.8
-        volts.add(float(f"{m.group(1)}.{m.group(2)}"))
-    for m in re.finditer(r"(?<![A-Z0-9])(\d+(?:\.\d+)?)\s*V(?![A-Z0-9])", u):  # 5V -> 5.0, 3.3V
-        try:
-            volts.add(float(m.group(1)))
-        except ValueError:
-            pass
-    return volts
+def _floating_warnings(data) -> list:
+    """Surfaced, not failed: individual open pins on an otherwise-wired part (an
+    unused GPIO or NC pin is legitimate; a floating AREF usually is not)."""
+    if not data:
+        return []
+    out = []
+    for ref, name, labels in nq.partially_floating_parts(data):
+        shown = ", ".join(labels[:8]) + (" …" if len(labels) > 8 else "")
+        out.append(f"{ref} ({name}): unconnected pin(s) {shown}")
+    return out
 
 
-def _check_power_topology(data: dict) -> list:
-    """The 'strong grader' ERC can't be: hard, high-confidence power-topology faults. Returns a list
-    of error strings ([] = sane). Conservative on purpose — only unambiguous faults fire, so a PASS
-    means something and the coder isn't sent chasing phantom problems:
-      A) a regulator with input and output on the SAME net (shorted/bypassed — does nothing),
-      B) two different voltage domains merged onto one net (e.g. USB 5V touching the 3V3 rail),
+def _power_topology_faults(data) -> list:
+    """Hard, high-confidence power faults ERC can't catch ([] = sane). Conservative
+    on purpose so a PASS means something:
+      A) a regulator with input and output on the SAME net (shorted/bypassed),
+      B) two voltage domains merged onto one net (e.g. 5V touching the 3V3 rail),
       C) a positive rail shorted to ground on one net.
     """
     if not data:
         return []
-    nets = data.get("nets", []) or []
-    parts = data.get("parts", []) or []
     errors = []
-
-    pin_net = {}
-    for nm, nodes in nets:
-        for ref, num, pname in nodes:
-            if pname:
-                pin_net[(ref, pname)] = nm
+    nets = nq.nets(data)
 
     # Rule B: one net carrying two recognized voltages = merged domains.
     for nm, nodes in nets:
         carriers = {}
-        for v in _net_voltage_tokens(nm):
+        for v in nq.net_voltage_tokens(nm):
             carriers.setdefault(v, f"net name '{nm}'")
-        for ref, num, pname in nodes:
-            for v in _net_voltage_tokens(pname):
+        for ref, _num, pname in nodes:
+            for v in nq.net_voltage_tokens(pname):
                 carriers.setdefault(v, f"{ref}.{pname}")
         if len(carriers) >= 2:
             vs = ", ".join(f"{v:g}V ({carriers[v]})" for v in sorted(carriers))
@@ -175,84 +174,103 @@ def _check_power_topology(data: dict) -> list:
 
     # Rule C: positive rail shorted to ground on the same net.
     for nm, nodes in nets:
-        volts = set(_net_voltage_tokens(nm))
-        for ref, num, pname in nodes:
-            volts |= _net_voltage_tokens(pname)
-        names_here = [nm.upper()] + [p.upper() for _, _, p in nodes if p]
+        volts = set(nq.net_voltage_tokens(nm))
+        for _ref, _num, pname in nodes:
+            volts |= nq.net_voltage_tokens(pname)
+        names_here = [nm.upper()] + [p.upper() for _r, _n, p in nodes if p]
         has_gnd = any(g in n for n in names_here for g in ("GND", "VSS", "GROUND"))
         if volts and has_gnd:
             errors.append(f"Net '{nm}' shorts a {max(volts):g}V rail to ground "
                           f"(same net carries both a supply and a ground pin).")
 
     # Rule A: regulator input net == output net.
-    IN, OUT = {"VI", "VIN", "+VIN"}, {"VO", "VOUT", "+VOUT"}
-    for ref, name, lib, pnames in parts:
-        in_pin = next((p for p in pnames if p and p.upper() in IN), None)
-        out_pin = next((p for p in pnames if p and p.upper() in OUT), None)
-        looks_reg = ("regulator" in (lib or "").lower()) or (in_pin and out_pin)
-        if not (looks_reg and in_pin and out_pin):
-            continue
-        in_net, out_net = pin_net.get((ref, in_pin)), pin_net.get((ref, out_pin))
+    for ref, name, in_pin, out_pin in nq.regulators(data):
+        in_net, out_net = nq.regulator_io_nets(data, ref, in_pin, out_pin)
         if in_net and out_net and in_net == out_net:
             errors.append(f"Regulator {ref} ({name}): input '{in_pin}' and output '{out_pin}' are on "
                           f"the SAME net '{in_net}' — it's shorted/bypassed, so the input voltage "
                           f"passes straight through to the output.")
 
-    return list(dict.fromkeys(errors))   # dedup, keep order
+    return list(dict.fromkeys(errors))
 
 
-# Parts that legitimately sit unconnected or stand alone — never counted as "floating"
-# (mounting holes, fiducials, test points, logos/graphics, net-ties, solder jumpers).
-_NONELECTRICAL = ("mountinghole", "fiducial", "testpoint", "test_point", "logo",
-                  "graphic", "net_tie", "nettie", "solderjumper")
+# When True, errors SKiDL reports while generating the netlist (most commonly a
+# missing footprint on a part) FAIL the build — a netlist you can't lay out isn't
+# really "built". Set False to surface them loudly as a warning instead, e.g. while
+# footprints are still assigned later in KiCad layout rather than in the SKiDL script.
+FAIL_ON_NETLIST_ERRORS = True
 
 
-def _check_unconnected(data: dict):
-    """Second strong-grader check: catch components that were placed but never wired.
+def _netlist_errors(raw_text: str):
+    """Parse the errors SKiDL reports during netlist generation from its RAW output
+    (must be the un-stripped stdout+stderr — _strip_skidl_noise removes these lines).
 
-    ERC reports unconnected pins only as WARNINGS, so a board with a floating crystal or a
-    forgotten AREF still 'builds'. We split the signal by confidence so a PASS still means
-    something and the coder isn't sent chasing legitimately-open pins:
-      hard:  a multi-pin part with EVERY pin floating — instantiated and connected to nothing
-             (e.g. xtal = Part('Device','Crystal') that's never wired). Unambiguous bug, so it
-             FAILS the build and BUILT-stop can't lock it in.
-      warns: individual floating pins on an otherwise-wired part (e.g. a floating AREF) — surfaced
-             loudly but NOT failed, because some pins are legitimately left open (unused GPIO, NC).
-    A pin counts as connected only if it shares a net with at least one OTHER pin; a pin alone on
-    its own net (or on no net) is floating, even if generate_netlist auto-named it.
-    Returns (hard_errors, warnings).
-    """
-    if not data:
-        return [], []
-    nets = data.get("nets", []) or []
-    parts = data.get("parts", []) or []
+    SKiDL prints each as 'ERROR: ...' and a summary 'N errors found while generating
+    netlist.' WARNINGS (e.g. 'Missing tag ... Random tag generated') are NOT counted —
+    those are benign and auto-resolved. Returns (count, sample_error_lines)."""
+    text = raw_text or ""
+    err_lines = [l.strip() for l in text.splitlines() if l.strip().startswith("ERROR:")]
+    m = re.search(r"(\d+)\s+error[s]?\s+found\s+while\s+generating\s+netlist", text)
+    count = int(m.group(1)) if m else len(err_lines)
+    seen, uniq = set(), []
+    for l in err_lines:
+        if l not in seen:
+            seen.add(l)
+            uniq.append(l)
+    return count, uniq[:12]
 
-    connected = {}                      # ref -> {pin names that share a net with >=1 other pin}
-    for nm, nodes in nets:
-        if len(nodes) < 2:              # a 1-pin net connects that pin to nothing
-            continue
-        for ref, num, pname in nodes:
-            if pname:
-                connected.setdefault(ref, set()).add(pname)
 
-    hard, warns = [], []
-    for ref, name, lib, pnames in parts:
-        if any(tok in f"{name} {lib}".lower() for tok in _NONELECTRICAL):
-            continue
-        pins = [p for p in pnames if p]
-        if not pins:
-            continue
-        conn = connected.get(ref, set())
-        floating = [p for p in pins if p not in conn]
-        if not floating:
-            continue
-        if len(pins) >= 2 and len(floating) == len(pins):
-            hard.append(f"{ref} ({name}) has NONE of its {len(pins)} pins connected — it was "
-                        f"placed but never wired into the circuit.")
-        else:
-            shown = ", ".join(floating[:8]) + (" …" if len(floating) > 8 else "")
-            warns.append(f"{ref} ({name}): unconnected pin(s) {shown}")
-    return list(dict.fromkeys(hard)), list(dict.fromkeys(warns))
+def _decide(returncode: int, net_present: bool, power_data, raw_output: str,
+            erc_text: str, visible_log: str) -> "CheckResult":
+    """Pure grading decision (no subprocess), so the BUILT/FAILED verdict is testable.
+
+    Layered grader: ERC + netlist must succeed (Layer 1); then the strong checks —
+    electrical topology + no fully-unwired part (Layer 2) — plus SKiDL's own netlist
+    errors (footprints), which a clean-looking board can still carry. Any of these is
+    a hard fault, so BUILT-stop can't lock in a board that's broken or unbuildable."""
+    if not (returncode == 0 and net_present):
+        return CheckResult(f"CIRCUIT FAILED (exit {returncode})\n{visible_log or '(no output)'}",
+                           "failed")
+
+    power_errors = _power_topology_faults(power_data)
+    float_errors = _floating_faults(power_data)
+    float_warnings = _floating_warnings(power_data)
+    nl_count, nl_lines = _netlist_errors(raw_output)
+
+    electrical = power_errors + float_errors
+    netlist_fatal = nl_lines if (FAIL_ON_NETLIST_ERRORS and nl_count) else []
+
+    if electrical or netlist_fatal:
+        msg = ["CIRCUIT FAILED — ERC passed and a netlist was generated, but the DESIGN "
+               "CHECK found faults:"]
+        if electrical:
+            msg.append("Electrical faults (make the board non-functional):")
+            msg += [f"  ✗ {e}" for e in electrical]
+        if netlist_fatal:
+            msg.append(f"Netlist errors ({nl_count}) — parts not buildable as-is "
+                       "(usually a missing footprint):")
+            msg += [f"  ✗ {e}" for e in netlist_fatal]
+        msg.append("Fix these, then re-check. Every part must be wired in (no part with all pins "
+                   "floating); each voltage is its OWN net; a regulator's input and output are "
+                   "DIFFERENT nets; and every part needs a footprint "
+                   "(Part(..., footprint='Library:Footprint')).")
+        return CheckResult("\n".join(msg), "failed")
+
+    parts = ["CIRCUIT BUILT — the script ran, ERC executed, a netlist was generated, and the "
+             "design checks (power topology + no fully-unwired parts + no netlist errors) passed.",
+             "Review the ERC report and fix any ERROR lines (warnings may be acceptable)."]
+    if float_warnings:
+        parts.append("⚠ Unconnected pins — not fatal, but confirm each is intentional (an "
+                     "unused GPIO is fine; a floating AREF or signal pin usually means a "
+                     "missing net):\n" + "\n".join(f"  • {w}" for w in float_warnings))
+    if not FAIL_ON_NETLIST_ERRORS and nl_count:
+        parts.append(f"⚠ Netlist reported {nl_count} error(s) (e.g. missing footprints) — "
+                     "surfaced, not blocking:\n" + "\n".join(f"  • {e}" for e in nl_lines))
+    if erc_text:
+        parts.append("ERC report:\n" + erc_text)
+    if visible_log:
+        parts.append("Log:\n" + visible_log)
+    return CheckResult("\n\n".join(parts), "built")
 
 
 def check_circuit(code: str) -> str:
@@ -293,7 +311,8 @@ def check_circuit(code: str) -> str:
     visible_stdout = "\n".join(l for l in raw_stdout.splitlines()
                                if not l.startswith("XORICS_POWER_"))
 
-    # Strip the warning spam BEFORE returning so the coder (and you) see the real error.
+    # Keep the raw (un-stripped) output for netlist-error parsing; strip noise for display.
+    raw_combined = raw_stdout + (proc.stderr or "")
     out = _strip_skidl_noise(visible_stdout + (proc.stderr or ""))
     nets = [f for f in os.listdir(workdir) if f.endswith(".net")]
     erc_files = [f for f in os.listdir(workdir) if f.endswith(".erc")]
@@ -308,36 +327,7 @@ def check_circuit(code: str) -> str:
     if len(out) > MAX_OUTPUT:
         out = "...(truncated)...\n" + out[-MAX_OUTPUT:]
 
-    if proc.returncode == 0 and nets:
-        # ERC + netlist passed (Layer 1). Now the strong grader (Layer 2): a board can be fully
-        # wired yet electrically wrong (5V shorted onto 3V3, a bypassed regulator), OR have a part
-        # that was placed but never wired (a floating crystal). Either is fatal — fail it so
-        # BUILT-stop can't lock in a bad design. Individual floating pins are surfaced as warnings.
-        power_errors = _check_power_topology(power_data) if power_data else []
-        float_errors, float_warnings = _check_unconnected(power_data) if power_data else ([], [])
-        hard_faults = power_errors + float_errors
-        if hard_faults:
-            msg = ["CIRCUIT FAILED — it wired up and ERC passed, but the DESIGN CHECK found fatal "
-                   "faults (these make the board non-functional):"]
-            msg += [f"  ✗ {e}" for e in hard_faults]
-            msg.append("Fix these, then re-check. Reminders: every part must be wired in (no "
-                       "component left with all pins floating); each voltage is its OWN net; a "
-                       "regulator's input and output are DIFFERENT nets "
-                       "(usb VBUS → reg['VI']; reg['VO'] → a separate 3V3 net → the 3V3 loads).")
-            return CheckResult("\n".join(msg), "failed")
-        parts = ["CIRCUIT BUILT — the script ran, ERC executed, a netlist was generated, and the "
-                 "design checks (power topology + no fully-unwired parts) passed.",
-                 "Review the ERC report and fix any ERROR lines (warnings may be acceptable)."]
-        if float_warnings:
-            parts.append("⚠ Unconnected pins — not fatal, but confirm each is intentional (an "
-                         "unused GPIO is fine; a floating AREF or signal pin usually means a "
-                         "missing net):\n" + "\n".join(f"  • {w}" for w in float_warnings))
-        if erc_text:
-            parts.append("ERC report:\n" + erc_text)
-        if out:
-            parts.append("Log:\n" + out)
-        return CheckResult("\n\n".join(parts), "built")
-    return CheckResult(f"CIRCUIT FAILED (exit {proc.returncode})\n{out or '(no output)'}", "failed")
+    return _decide(proc.returncode, bool(nets), power_data, raw_combined, erc_text, out)
 
 
 def _find_part_helper_src() -> str:
