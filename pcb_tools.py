@@ -1,22 +1,3 @@
-# Xorics — a self-hosted local AI assistant for embedded / PCB engineering.
-# Copyright (C) 2026 Zawayix
-#
-# This file is part of Xorics. Xorics is free software: you can redistribute it
-# and/or modify it under the terms of the GNU Affero General Public License as
-# published by the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Xorics is distributed in the hope that it will be useful, but WITHOUT ANY
-# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
-# A PARTICULAR PURPOSE. See the GNU Affero General Public License for details.
-#
-# You should have received a copy of the GNU Affero General Public License along
-# with Xorics. If not, see <https://www.gnu.org/licenses/>.
-#
-# ADDITIONAL PERMISSION (AGPLv3 section 7): designs and files produced by RUNNING
-# Xorics, and any fragments it embeds into that output, are NOT covered by the
-# AGPL — you may license your generated designs as you wish. See LICENSE-EXCEPTION.
-
 """
 pcb_tools.py — run + package SKiDL circuit designs for Xorics' PCB side.
 
@@ -201,6 +182,60 @@ def _check_power_topology(data: dict) -> list:
     return list(dict.fromkeys(errors))   # dedup, keep order
 
 
+# Parts that legitimately sit unconnected or stand alone — never counted as "floating"
+# (mounting holes, fiducials, test points, logos/graphics, net-ties, solder jumpers).
+_NONELECTRICAL = ("mountinghole", "fiducial", "testpoint", "test_point", "logo",
+                  "graphic", "net_tie", "nettie", "solderjumper")
+
+
+def _check_unconnected(data: dict):
+    """Second strong-grader check: catch components that were placed but never wired.
+
+    ERC reports unconnected pins only as WARNINGS, so a board with a floating crystal or a
+    forgotten AREF still 'builds'. We split the signal by confidence so a PASS still means
+    something and the coder isn't sent chasing legitimately-open pins:
+      hard:  a multi-pin part with EVERY pin floating — instantiated and connected to nothing
+             (e.g. xtal = Part('Device','Crystal') that's never wired). Unambiguous bug, so it
+             FAILS the build and BUILT-stop can't lock it in.
+      warns: individual floating pins on an otherwise-wired part (e.g. a floating AREF) — surfaced
+             loudly but NOT failed, because some pins are legitimately left open (unused GPIO, NC).
+    A pin counts as connected only if it shares a net with at least one OTHER pin; a pin alone on
+    its own net (or on no net) is floating, even if generate_netlist auto-named it.
+    Returns (hard_errors, warnings).
+    """
+    if not data:
+        return [], []
+    nets = data.get("nets", []) or []
+    parts = data.get("parts", []) or []
+
+    connected = {}                      # ref -> {pin names that share a net with >=1 other pin}
+    for nm, nodes in nets:
+        if len(nodes) < 2:              # a 1-pin net connects that pin to nothing
+            continue
+        for ref, num, pname in nodes:
+            if pname:
+                connected.setdefault(ref, set()).add(pname)
+
+    hard, warns = [], []
+    for ref, name, lib, pnames in parts:
+        if any(tok in f"{name} {lib}".lower() for tok in _NONELECTRICAL):
+            continue
+        pins = [p for p in pnames if p]
+        if not pins:
+            continue
+        conn = connected.get(ref, set())
+        floating = [p for p in pins if p not in conn]
+        if not floating:
+            continue
+        if len(pins) >= 2 and len(floating) == len(pins):
+            hard.append(f"{ref} ({name}) has NONE of its {len(pins)} pins connected — it was "
+                        f"placed but never wired into the circuit.")
+        else:
+            shown = ", ".join(floating[:8]) + (" …" if len(floating) > 8 else "")
+            warns.append(f"{ref} ({name}): unconnected pin(s) {shown}")
+    return list(dict.fromkeys(hard)), list(dict.fromkeys(warns))
+
+
 def check_circuit(code: str) -> str:
     """Run a SKiDL script (should call ERC() + generate_netlist()) and report the result."""
     if not Path(SKIDL_PYTHON).exists():
@@ -255,21 +290,29 @@ def check_circuit(code: str) -> str:
         out = "...(truncated)...\n" + out[-MAX_OUTPUT:]
 
     if proc.returncode == 0 and nets:
-        # ERC + netlist passed (Layer 1). Now the topology grader (Layer 2): a board can be fully
-        # wired yet electrically wrong (5V shorted onto 3V3, a bypassed regulator). If it finds a
-        # hard fault, this is NOT a built board — fail it so BUILT-stop can't lock in a bad design.
+        # ERC + netlist passed (Layer 1). Now the strong grader (Layer 2): a board can be fully
+        # wired yet electrically wrong (5V shorted onto 3V3, a bypassed regulator), OR have a part
+        # that was placed but never wired (a floating crystal). Either is fatal — fail it so
+        # BUILT-stop can't lock in a bad design. Individual floating pins are surfaced as warnings.
         power_errors = _check_power_topology(power_data) if power_data else []
-        if power_errors:
-            msg = ["CIRCUIT FAILED — it wired up and ERC passed, but the POWER CHECK found fatal "
-                   "topology faults (these damage hardware or make the board non-functional):"]
-            msg += [f"  ✗ {e}" for e in power_errors]
-            msg.append("Fix the topology, then re-check. Rule: each voltage is its OWN net, and a "
+        float_errors, float_warnings = _check_unconnected(power_data) if power_data else ([], [])
+        hard_faults = power_errors + float_errors
+        if hard_faults:
+            msg = ["CIRCUIT FAILED — it wired up and ERC passed, but the DESIGN CHECK found fatal "
+                   "faults (these make the board non-functional):"]
+            msg += [f"  ✗ {e}" for e in hard_faults]
+            msg.append("Fix these, then re-check. Reminders: every part must be wired in (no "
+                       "component left with all pins floating); each voltage is its OWN net; a "
                        "regulator's input and output are DIFFERENT nets "
                        "(usb VBUS → reg['VI']; reg['VO'] → a separate 3V3 net → the 3V3 loads).")
             return CheckResult("\n".join(msg), "failed")
         parts = ["CIRCUIT BUILT — the script ran, ERC executed, a netlist was generated, and the "
-                 "power topology passed.",
+                 "design checks (power topology + no fully-unwired parts) passed.",
                  "Review the ERC report and fix any ERROR lines (warnings may be acceptable)."]
+        if float_warnings:
+            parts.append("⚠ Unconnected pins — not fatal, but confirm each is intentional (an "
+                         "unused GPIO is fine; a floating AREF or signal pin usually means a "
+                         "missing net):\n" + "\n".join(f"  • {w}" for w in float_warnings))
         if erc_text:
             parts.append("ERC report:\n" + erc_text)
         if out:
