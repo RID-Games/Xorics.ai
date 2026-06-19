@@ -530,7 +530,12 @@ def check_circuit(code: str) -> str:
     if len(out) > MAX_OUTPUT:
         out = "...(truncated)...\n" + out[-MAX_OUTPUT:]
 
-    return _decide(proc.returncode, bool(nets), power_data, raw_combined, erc_text, out)
+    result = _decide(proc.returncode, bool(nets), power_data, raw_combined, erc_text, out)
+    if proc.returncode != 0:
+        hint = _no_pin_help(code, raw_combined)   # rewrite a cryptic 'No pins found' crash
+        if hint:
+            return CheckResult(f"{result}\n\n{hint}", result.status)
+    return result
 
 
 def _find_part_helper_src() -> str:
@@ -1068,6 +1073,79 @@ def part_pins(library: str, name: str) -> str:
     return _format_pins(library, name, pin_pairs)
 
 
+# --- 'No pins found' rescue ---------------------------------------------------------
+# When a SKiDL script connects to a pin the symbol doesn't have, SKiDL logs
+#   ERROR: No pins found using <Name>:<Ref>[('<pin>',)]
+# then dies with `unsupported operand type(s) for +=: 'NoneType' and 'Net'` (the bad index
+# returned None). The TypeError is what the coder sees and thrashes on; the real signal —
+# which part, which bad pin — is the ERROR line above it. These turn that into a fix.
+
+_NO_PIN_RE = re.compile(r"No pins found using (.+?):([^\[\s]+)\[\((.*?)\)\]")
+
+def _no_pin_faults(raw_output: str):
+    """[(part_name, ref, [bad_pin, ...]), ...] parsed from SKiDL's 'No pins found' ERROR
+    lines. Pure (regex only) so it's unit-testable without skidl."""
+    faults = []
+    for m in _NO_PIN_RE.finditer(raw_output or ""):
+        name, ref, inside = m.group(1).strip(), m.group(2).strip(), m.group(3)
+        bad = re.findall(r"'([^']*)'", inside) or [t.strip() for t in inside.split(",") if t.strip()]
+        faults.append((name, ref, bad))
+    return faults
+
+
+def _lib_for_part(code: str, name: str):
+    """Recover the LIBRARY a part was instantiated from by reading the script's Part('lib','name')
+    call (SKiDL's error gives the name + ref but not the library). None if not found."""
+    m = re.search(r"Part\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]" + re.escape(name) + r"['\"]", code or "")
+    return m.group(1) if m else None
+
+
+def _real_pins(library: str, name: str):
+    """Unique real pin NAMES for a symbol (reusing the part_pins loader), or None if it can't
+    be loaded. Pulled out as its own function so the hint assembler can be tested with it stubbed."""
+    try:
+        data = _run_helper_src(_pins_helper_src(), [library, name], _kicad_env(), timeout=180)
+    except Exception:
+        return None
+    if not data or not data.get("ok"):
+        return None
+    seen, names = set(), []
+    for pair in data.get("pins", []):
+        nm = (pair[1] if len(pair) > 1 else "").strip()
+        if nm and nm != "~" and nm not in seen:
+            seen.add(nm)
+            names.append(nm)
+    return names or None
+
+
+def _no_pin_help(code: str, raw_output: str) -> str:
+    """Turn a 'No pins found' crash into actionable feedback: name the bad pin and list the
+    part's REAL pin names so the coder reconnects, instead of re-researching the part (the
+    thrash this fixes). Empty string if the failure isn't a pin-name one."""
+    faults = _no_pin_faults(raw_output)
+    if not faults:
+        return ""
+    out = []
+    for name, ref, badpins in faults:
+        bp = ", ".join(f"'{p}'" for p in badpins) or "(unnamed)"
+        lib = _lib_for_part(code, name)
+        real = _real_pins(lib, name) if lib else None
+        if real:
+            shown = ", ".join(real[:28]) + (" …" if len(real) > 28 else "")
+            out.append(f"{ref} ({name}): pin {bp} doesn't exist on this symbol. Real pin names: "
+                       f"{shown}. Reconnect using those EXACT names (KiCad names differ from "
+                       f"datasheet names — e.g. 'IO0' not 'GPIO0').")
+        elif lib:
+            out.append(f"{ref} ({name}): pin {bp} doesn't exist. Run part_pins('{lib}','{name}') "
+                       f"for the real pin names, then reconnect to those.")
+        else:
+            out.append(f"{ref} ({name}): pin {bp} doesn't exist. find_part('{name}') to get its "
+                       f"library, then part_pins(library,'{name}') for the real pin names.")
+    return ("Pin-name fix — the script connected to pins the symbol doesn't have. Fix the pin "
+            "NAME (don't re-search the part — the library:name is already right):\n"
+            + "\n".join(f"  • {l}" for l in out))
+
+
 def check_circuit_file(path: str) -> str:
     """Validate a SKiDL script that is already SAVED on disk, by path: read the file and run
     check_circuit on its contents. Lets the coder repair an existing circuits/<name>/<name>.py
@@ -1121,6 +1199,18 @@ def _all_footprints():
     return out
 
 
+def _footprint_family_match(name, q_tokens, q_norm):
+    """True if the footprint's own NAME carries the query's package family — not just a
+    shared LIBRARY token (the 'SOT' in Package_TO_SOT_SMD also covers TO-xx packages).
+    Keeps same-pad-count, wrong-family hits out of the lead (TO-52-3 for a 'SOT-223' query,
+    or an inductor that only matched the bare number '223')."""
+    nsq = "".join(_tokenize(name))
+    if q_norm and q_norm in nsq:
+        return True
+    alpha = [t for t in q_tokens if not t.isdigit()]
+    return bool(alpha) and all(t in nsq for t in alpha)
+
+
 def find_footprint(query: str, pins: int = 0) -> str:
     """Search the installed KiCad footprint libraries for REAL, loadable footprints matching
     `query`, returned as exact 'Library:Footprint' strings — what goes straight into
@@ -1150,7 +1240,13 @@ def find_footprint(query: str, pins: int = 0) -> str:
                 f"'0603', 'SOIC-8', 'USB_C', or 'Conn_01x04'.")
 
     ranked = _rank_candidates(query, pool, [c for _id, c in pool])
-    top = [fid for fid, _c in ranked[:12]]
+    # Category promote: a footprint whose own NAME carries the queried family beats a same-pad
+    # coincidence that only shared a LIBRARY token. So 'SOT-223' leads with real SOT-223s.
+    fam, other = [], []
+    for fid, _c in ranked:
+        (fam if _footprint_family_match(fid.split(":", 1)[1], q_tokens, q_norm) else other).append(fid)
+    fam_ids = set(fam)
+    top = (fam + other)[:12]
     padcount = {fid: (len(_footprint_pad_numbers(fid) or ()) or None) for fid in top}
 
     def fmt(fid):
@@ -1158,7 +1254,9 @@ def find_footprint(query: str, pins: int = 0) -> str:
         return f"  {fid}" + (f"   ({n} pads)" if n else "")
 
     if pins > 0:
-        match = [f for f in top if padcount.get(f) == pins]
+        padmatch = [f for f in top if padcount.get(f) == pins]
+        fam_padmatch = [f for f in padmatch if f in fam_ids]
+        match = fam_padmatch or padmatch            # prefer the right family; fall back if none
         rest = [f for f in top if f not in match]
         lines = [f"Footprints for '{query}' (need {pins} pads — pads must cover the part's pins):"]
         lines += ([fmt(f) for f in match] if match

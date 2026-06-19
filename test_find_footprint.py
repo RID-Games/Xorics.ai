@@ -78,5 +78,15 @@ check("  and _resolve_footprint agrees it's loadable",
       pcb._resolve_footprint("Zzz_TestKit:USBC_zqxmark")[0] == "ok")
 print()
 
+# ---- 5) category promotion (name family beats same-pad coincidence) ------
+print("category promotion")
+# query the R0603 family with pins=2; R0402 is also 2 pads but a different family —
+# it must rank below the family match (and not lead the 'need 2 pads' list).
+r = pcb.find_footprint("R0603_zqxmark", pins=2)
+check("family match R0603 present", "Zzz_TestKit:R0603_zqxmark" in r)
+check("family match ranked above same-pad non-family R0402",
+      "R0402_zqxmark" not in r or r.index("R0603_zqxmark") < r.index("R0402_zqxmark"))
+print()
+
 print(f"==== {_p} passed, {_f} failed ====")
 raise SystemExit(1 if _f else 0)
