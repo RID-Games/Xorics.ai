@@ -149,6 +149,47 @@ def _floating_warnings(data) -> list:
     return out
 
 
+# A USB-C receptacle whose CC1/CC2 pins float can't enumerate or negotiate power: a
+# sink needs Rd (5.1k to GND) on CC, a source needs Rp. The generic floating-pin check
+# (_floating_warnings) treats individual open pins as benign — an unused GPIO/NC pin is
+# legitimate — so CC needs its own rule that knows CC is never benign on a USB-C port.
+# Default: surface as a WARNING so the rule can be watched against real boards first;
+# flip True to make floating CC a hard (build-failing) fault once it's trusted.
+FAIL_ON_FLOATING_USB_CC = False
+
+
+def _is_usb_c_part(name, lib, pins):
+    """A USB-C receptacle: named like one, or exposing the CC pins (covers renamed
+    symbols and any USB-C-style connector)."""
+    blob = f"{name} {lib}".lower()
+    if "usb_c" in blob or "usb-c" in blob or "usbc" in blob:
+        return True
+    pnames = {nm.strip().upper() for (_n, nm) in pins}
+    return "CC1" in pnames and "CC2" in pnames
+
+
+def _usb_cc_faults(data):
+    """(faults, warnings): a USB-C receptacle with a floating CC pin. Reuses
+    nq.floating_pins, so 'floating' means exactly what it does everywhere else in the
+    grader. Loose first cut — it flags CC floating; it does NOT yet verify there is a
+    ~5.1k Rd or that CC reaches GND (those are the stricter tiers). Whether a hit is a
+    fault or a warning is controlled by FAIL_ON_FLOATING_USB_CC (default: warning)."""
+    if not data:
+        return [], []
+    faults, warns = [], []
+    for ref, name, lib, pins in nq.parts(data):
+        if not _is_usb_c_part(name, lib, pins):
+            continue
+        cc_open = sorted({nm.strip().upper() for (_n, nm) in nq.floating_pins(data, ref)
+                          if nm.strip().upper() in ("CC", "CC1", "CC2")})
+        if not cc_open:
+            continue
+        msg = (f"{ref} ({name}): USB-C {', '.join(cc_open)} floating — the port can't "
+               f"enumerate or negotiate power without Rd (5.1k to GND) on CC.")
+        (faults if FAIL_ON_FLOATING_USB_CC else warns).append(msg)
+    return faults, warns
+
+
 def _power_topology_faults(data) -> list:
     """Hard, high-confidence power faults ERC can't catch ([] = sane). Conservative
     on purpose so a PASS means something:
@@ -385,9 +426,10 @@ def _decide(returncode: int, net_present: bool, power_data, raw_output: str,
     fp_res_faults, fp_res_warnings = _footprint_resolution_faults(power_data)
     fp_faults = fp_res_faults + fp_faults          # name-doesn't-resolve before pad mismatch
     fp_warnings = fp_res_warnings + fp_warnings
+    usb_faults, usb_warnings = _usb_cc_faults(power_data)   # floating CC1/CC2 on a USB-C port
     nl_count, nl_lines = _netlist_errors(raw_output)
 
-    electrical = power_errors + float_errors
+    electrical = power_errors + float_errors + usb_faults
     netlist_fatal = nl_lines if (FAIL_ON_NETLIST_ERRORS and nl_count) else []
 
     if electrical or fp_faults or netlist_fatal:
@@ -417,6 +459,10 @@ def _decide(returncode: int, net_present: bool, power_data, raw_output: str,
         parts.append("⚠ Unconnected pins — not fatal, but confirm each is intentional (an "
                      "unused GPIO is fine; a floating AREF or signal pin usually means a "
                      "missing net):\n" + "\n".join(f"  • {w}" for w in float_warnings))
+    if usb_warnings:
+        parts.append("⚠ USB-C CC pin(s) floating — the port won't enumerate or draw power "
+                     "without Rd (5.1k to GND) on CC; confirm this is intended:\n"
+                     + "\n".join(f"  • {w}" for w in usb_warnings))
     if fp_warnings:
         parts.append("⚠ Footprint may be wrong — pads don't fully match the symbol; verify the "
                      "part's package:\n" + "\n".join(f"  • {w}" for w in fp_warnings))
