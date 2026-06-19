@@ -111,9 +111,11 @@ try:
     for _p in _xc.parts:
         _xlib = (getattr(getattr(_p, "lib", None), "filename", "")
                  or getattr(getattr(_p, "lib", None), "name", "") or "")
+        _xfp = str(getattr(_p, "footprint", "") or "")
         _xparts.append([str(getattr(_p, "ref", "?")), str(getattr(_p, "name", "")),
                         str(_xlib),
-                        [[str(getattr(_pp, "num", "")), str(getattr(_pp, "name", ""))] for _pp in _p.pins]])
+                        [[str(getattr(_pp, "num", "")), str(getattr(_pp, "name", ""))] for _pp in _p.pins],
+                        _xfp])
     print("XORICS_POWER_JSON:" + _xj.dumps({"nets": _xnets, "parts": _xparts}))
 except Exception as _xe:
     print("XORICS_POWER_ERR:" + repr(_xe))
@@ -194,6 +196,80 @@ def _power_topology_faults(data) -> list:
     return list(dict.fromkeys(errors))
 
 
+# --- footprint sanity (netlist-level, no layout/DRC needed) -----------------
+# Checks the pin<->pad NUMBER correspondence the netlist already determines, which
+# catches a footprint whose pads don't match the symbol — WITHOUT a placed board:
+#   fault   = a symbol pin with no landing pad (those pins would be unconnected;
+#             unambiguous, zero false positives).
+#   warning = the footprint carries numbered pads with no matching pin (usually the
+#             WRONG footprint — e.g. an AMS1117, a 3-pin SOT-223, given an 8-pad
+#             SOIC-8 — but occasionally legit, so surfaced, not failed).
+# GEOMETRIC correctness (pad shape/spacing, clearances) still belongs to KiCad DRC;
+# this is the cheap netlist-tier check that needs no layout.
+
+def _footprint_dirs() -> list:
+    dirs = [os.environ[v] for v in ("KICAD9_FOOTPRINT_DIR", "KICAD8_FOOTPRINT_DIR",
+                                    "KICAD7_FOOTPRINT_DIR", "KICAD6_FOOTPRINT_DIR",
+                                    "KICAD_FOOTPRINT_DIR") if os.environ.get(v)]
+    dirs.append("/usr/share/kicad/footprints")
+    return dirs
+
+
+def _footprint_pad_numbers(footprint: str):
+    """Set of non-empty pad NUMBERS in a 'Lib:Name' footprint, or None if the
+    .kicad_mod can't be found/parsed — so we degrade and never fail a build we
+    could not actually verify."""
+    if not footprint or ":" not in footprint:
+        return None
+    lib, name = footprint.split(":", 1)
+    for base in _footprint_dirs():
+        path = os.path.join(base, lib + ".pretty", name + ".kicad_mod")
+        if not os.path.exists(path):
+            continue
+        try:
+            txt = Path(path).read_text(errors="ignore")
+        except Exception:
+            return None
+        nums = {m.group(1).strip() for m in re.finditer(r'\(pad\s+"([^"]*)"', txt)
+                if m.group(1).strip()}
+        return nums or None      # zero pads parsed -> unverifiable, skip
+    return None
+
+
+def _sortnums(s):
+    return sorted(s, key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
+
+
+def _footprint_mismatches(data):
+    """(faults, warnings) from comparing each part's symbol pin numbers against its
+    footprint's pad numbers. See the section comment above for the fault/warning split."""
+    if not data:
+        return [], []
+    faults, warns = [], []
+    fps = nq.footprints(data)
+    for ref, name, _lib, pins in nq.parts(data):
+        fp = fps.get(ref, "")
+        if not fp:
+            continue                          # a missing footprint is the netlist-error gate's job
+        pads = _footprint_pad_numbers(fp)
+        if pads is None:
+            continue                          # couldn't verify -> skip (degrade, never regress)
+        pin_nums = {n for (n, _nm) in pins if n}
+        if not pin_nums:
+            continue
+        missing = pin_nums - pads
+        extra = pads - pin_nums
+        if missing:
+            faults.append(f"{ref} ({name}): footprint '{fp}' has no pad for pin(s) "
+                          f"{_sortnums(missing)} — those pins would be unconnected on the board "
+                          f"(symbol pins {_sortnums(pin_nums)} vs footprint pads {_sortnums(pads)}).")
+        elif extra:
+            warns.append(f"{ref} ({name}): footprint '{fp}' has {len(extra)} numbered pad(s) "
+                         f"{_sortnums(extra)} with no matching symbol pin — likely the wrong "
+                         f"footprint for this part.")
+    return faults, warns
+
+
 # When True, errors SKiDL reports while generating the netlist (most commonly a
 # missing footprint on a part) FAIL the build — a netlist you can't lay out isn't
 # really "built". Set False to surface them loudly as a warning instead, e.g. while
@@ -235,34 +311,42 @@ def _decide(returncode: int, net_present: bool, power_data, raw_output: str,
     power_errors = _power_topology_faults(power_data)
     float_errors = _floating_faults(power_data)
     float_warnings = _floating_warnings(power_data)
+    fp_faults, fp_warnings = _footprint_mismatches(power_data)
     nl_count, nl_lines = _netlist_errors(raw_output)
 
     electrical = power_errors + float_errors
     netlist_fatal = nl_lines if (FAIL_ON_NETLIST_ERRORS and nl_count) else []
 
-    if electrical or netlist_fatal:
+    if electrical or fp_faults or netlist_fatal:
         msg = ["CIRCUIT FAILED — ERC passed and a netlist was generated, but the DESIGN "
                "CHECK found faults:"]
         if electrical:
             msg.append("Electrical faults (make the board non-functional):")
             msg += [f"  ✗ {e}" for e in electrical]
+        if fp_faults:
+            msg.append("Footprint faults (pins with no matching pad — unbuildable):")
+            msg += [f"  ✗ {e}" for e in fp_faults]
         if netlist_fatal:
             msg.append(f"Netlist errors ({nl_count}) — parts not buildable as-is "
                        "(usually a missing footprint):")
             msg += [f"  ✗ {e}" for e in netlist_fatal]
         msg.append("Fix these, then re-check. Every part must be wired in (no part with all pins "
                    "floating); each voltage is its OWN net; a regulator's input and output are "
-                   "DIFFERENT nets; and every part needs a footprint "
+                   "DIFFERENT nets; and every part needs a footprint whose pads match its pins "
                    "(Part(..., footprint='Library:Footprint')).")
         return CheckResult("\n".join(msg), "failed")
 
     parts = ["CIRCUIT BUILT — the script ran, ERC executed, a netlist was generated, and the "
-             "design checks (power topology + no fully-unwired parts + no netlist errors) passed.",
+             "design checks (power topology + no fully-unwired parts + footprint pads match pins "
+             "+ no netlist errors) passed.",
              "Review the ERC report and fix any ERROR lines (warnings may be acceptable)."]
     if float_warnings:
         parts.append("⚠ Unconnected pins — not fatal, but confirm each is intentional (an "
                      "unused GPIO is fine; a floating AREF or signal pin usually means a "
                      "missing net):\n" + "\n".join(f"  • {w}" for w in float_warnings))
+    if fp_warnings:
+        parts.append("⚠ Footprint may be wrong — pads don't fully match the symbol; verify the "
+                     "part's package:\n" + "\n".join(f"  • {w}" for w in fp_warnings))
     if not FAIL_ON_NETLIST_ERRORS and nl_count:
         parts.append(f"⚠ Netlist reported {nl_count} error(s) (e.g. missing footprints) — "
                      "surfaced, not blocking:\n" + "\n".join(f"  • {e}" for e in nl_lines))

@@ -137,6 +137,16 @@ def part_refs(data):
     return [ref for ref, _n, _l, _p in parts(data)]
 
 
+def footprints(data):
+    """{ref: footprint_str} from the part record's 5th field (empty if absent)."""
+    out = {}
+    for rec in (data or {}).get("parts", []) or []:
+        rec = rec or []
+        ref = _s(rec[0]) if len(rec) > 0 else "?"
+        out[ref] = _s(rec[4]) if len(rec) > 4 else ""
+    return out
+
+
 def pins_of(data, ref):
     """[(num, name), ...] for the given part ref (empty if not found)."""
     for r, _n, _l, pins in parts(data):
