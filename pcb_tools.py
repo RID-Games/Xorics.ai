@@ -215,34 +215,104 @@ def _footprint_dirs() -> list:
     return dirs
 
 
+def _resolve_footprint(footprint: str):
+    """Resolve a 'Lib:Name' footprint against the footprint dirs. Returns (status, path):
+
+      'ok'        the .kicad_mod exists; `path` is its full filename.
+      'bad_name'  the Lib.pretty dir IS present but Name.kicad_mod is not in it — the
+                  library is installed, the footprint name simply isn't real. A
+                  hallucinated/mistyped name; this will NOT import into KiCad (fatal).
+      'unknown'   no Lib.pretty dir in any footprint dir — library not installed, or we
+                  are looking in the wrong place. Unverifiable -> degrade, never fail.
+      'malformed' not 'Lib:Name' shaped.
+
+    `path` is None unless status == 'ok'. This is the resolution half that the pad check
+    (_footprint_pad_numbers) and the name check (_footprint_mismatches) both build on."""
+    if not footprint or ":" not in footprint:
+        return "malformed", None
+    lib, name = footprint.split(":", 1)
+    if not lib.strip() or not name.strip():
+        return "malformed", None
+    lib_dir_seen = False
+    for base in _footprint_dirs():
+        pdir = os.path.join(base, lib + ".pretty")
+        if os.path.isdir(pdir):
+            lib_dir_seen = True
+            path = os.path.join(pdir, name + ".kicad_mod")
+            if os.path.exists(path):
+                return "ok", path
+    return ("bad_name" if lib_dir_seen else "unknown"), None
+
+
 def _footprint_pad_numbers(footprint: str):
     """Set of non-empty pad NUMBERS in a 'Lib:Name' footprint, or None if the
-    .kicad_mod can't be found/parsed — so we degrade and never fail a build we
-    could not actually verify."""
-    if not footprint or ":" not in footprint:
+    .kicad_mod can't be found/parsed — so the PAD check degrades and never fails a
+    build it could not actually verify. (Name resolution — a fake-but-plausible name
+    that points at no real file — is handled separately by _resolve_footprint /
+    _footprint_mismatches; here a non-resolving name simply yields None.)"""
+    status, path = _resolve_footprint(footprint)
+    if status != "ok":
         return None
-    lib, name = footprint.split(":", 1)
-    for base in _footprint_dirs():
-        path = os.path.join(base, lib + ".pretty", name + ".kicad_mod")
-        if not os.path.exists(path):
-            continue
-        try:
-            txt = Path(path).read_text(errors="ignore")
-        except Exception:
-            return None
-        nums = {m.group(1).strip() for m in re.finditer(r'\(pad\s+"([^"]*)"', txt)
-                if m.group(1).strip()}
-        return nums or None      # zero pads parsed -> unverifiable, skip
-    return None
+    try:
+        txt = Path(path).read_text(errors="ignore")
+    except Exception:
+        return None
+    nums = {m.group(1).strip() for m in re.finditer(r'\(pad\s+"([^"]*)"', txt)
+            if m.group(1).strip()}
+    return nums or None      # zero pads parsed -> unverifiable, skip
 
 
 def _sortnums(s):
     return sorted(s, key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
 
 
+# A footprint whose LIBRARY isn't found in any footprint dir can't be checked. By
+# default that case degrades silently (on a correctly-configured box it just means the
+# library isn't installed). Flip this True to surface it as a warning instead — useful
+# if you suspect the coder is inventing library names too, at the cost of some noise.
+# A footprint whose library IS present but whose NAME doesn't resolve is ALWAYS a hard
+# fault regardless of this flag (unambiguous — it won't import into KiCad).
+WARN_ON_UNKNOWN_FOOTPRINT_LIB = False
+
+
+def _footprint_resolution_faults(data):
+    """(faults, warnings) from NAME RESOLUTION alone: does each part's 'Lib:Name'
+    footprint point at a real .kicad_mod? A name whose library exists but whose file
+    does not is the coder hallucinating a plausible-but-fake footprint — the same
+    failure mode that sank atopile, now for footprints. This is independent of, and
+    runs alongside, the pad/pin match in _footprint_mismatches (a non-resolving name
+    can't also produce a pad fault — _footprint_pad_numbers returns None for it)."""
+    if not data:
+        return [], []
+    faults, warns = [], []
+    fps = nq.footprints(data)
+    for ref, name, _lib, _pins in nq.parts(data):
+        fp = fps.get(ref, "")
+        if not fp:
+            continue                          # a missing footprint is the netlist-error gate's job
+        status, _path = _resolve_footprint(fp)
+        if status == "bad_name":
+            lib, fpname = fp.split(":", 1)
+            faults.append(f"{ref} ({name}): footprint '{fp}' does not exist — library "
+                          f"'{lib}' is installed but has no '{fpname}.kicad_mod' "
+                          f"(hallucinated or mistyped name; it will NOT import into KiCad).")
+        elif status == "malformed":
+            faults.append(f"{ref} ({name}): footprint '{fp}' is not in 'Library:Footprint' "
+                          f"form — it won't resolve in KiCad.")
+        elif status == "unknown" and WARN_ON_UNKNOWN_FOOTPRINT_LIB:
+            lib = fp.split(":", 1)[0]
+            warns.append(f"{ref} ({name}): footprint library '{lib}' not found in any "
+                         f"footprint dir — can't verify '{fp}' (is the library installed?).")
+        # 'ok' -> resolves; 'unknown' with the flag off -> degrade silently.
+    return faults, warns
+
+
 def _footprint_mismatches(data):
     """(faults, warnings) from comparing each part's symbol pin numbers against its
-    footprint's pad numbers. See the section comment above for the fault/warning split."""
+    footprint's pad numbers. Only footprints that resolve to a real file are checked
+    (_footprint_pad_numbers returns None otherwise); a fake NAME is caught upstream by
+    _footprint_resolution_faults. See the section comment above for the fault/warning
+    split."""
     if not data:
         return [], []
     faults, warns = [], []
@@ -312,6 +382,9 @@ def _decide(returncode: int, net_present: bool, power_data, raw_output: str,
     float_errors = _floating_faults(power_data)
     float_warnings = _floating_warnings(power_data)
     fp_faults, fp_warnings = _footprint_mismatches(power_data)
+    fp_res_faults, fp_res_warnings = _footprint_resolution_faults(power_data)
+    fp_faults = fp_res_faults + fp_faults          # name-doesn't-resolve before pad mismatch
+    fp_warnings = fp_res_warnings + fp_warnings
     nl_count, nl_lines = _netlist_errors(raw_output)
 
     electrical = power_errors + float_errors
@@ -324,7 +397,7 @@ def _decide(returncode: int, net_present: bool, power_data, raw_output: str,
             msg.append("Electrical faults (make the board non-functional):")
             msg += [f"  ✗ {e}" for e in electrical]
         if fp_faults:
-            msg.append("Footprint faults (pins with no matching pad — unbuildable):")
+            msg.append("Footprint faults (won't import into KiCad — unbuildable):")
             msg += [f"  ✗ {e}" for e in fp_faults]
         if netlist_fatal:
             msg.append(f"Netlist errors ({nl_count}) — parts not buildable as-is "

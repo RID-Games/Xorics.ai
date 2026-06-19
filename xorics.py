@@ -422,10 +422,13 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
     With no TTY, or for the manager (checkpoint=False), CODER_BACKSTOP caps an unattended
     run so it can't spin forever. History is trimmed every turn either way.
 
-    Returns (final_text, messages).
+    Returns (final_text, messages, built_path). built_path is set only when the BUILT
+    verdict came from check_circuit_file (an already-saved script) so the caller can
+    report that path instead of re-slugifying and re-saving it; None otherwise.
     """
     interactive = checkpoint and sys.stdin.isatty()
     final_text = "(no final message)"
+    built_path = None                            # set iff BUILT came from a file path
     # XORICS-FEATURE: coder-notebook -- externalized resolved-parts memory + dedup guard
     notebook = Notebook(task=messages[1]["content"]) if tag == "coder" and len(messages) > 1 else None
     base_system = messages[0]["content"]
@@ -490,7 +493,8 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
                     # wandered off rebuilding a board that had already passed (and broke it).
                     try:
                         from pathlib import Path as _P
-                        built_code = _P(args["path"]).expanduser().read_text()
+                        built_path = str(_P(args["path"]).expanduser())   # report this; don't re-slug
+                        built_code = _P(built_path).read_text()
                     except Exception:
                         built_code = ""   # unreadable, but it built — still stop (below)
             elif getattr(result, "status", None) == "user_stopped":  # XORICS-FEATURE: coder-control
@@ -506,7 +510,7 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
                 "verified design (further edits are disabled so a passing board can't be broken).\n\n"
                 "```python\n" + (built_code or "") + "\n```")
             break
-    return final_text, messages
+    return final_text, messages, built_path
 
 
 # ---- The coder sub-session (runs on the coder brain, returns a saved file) -----
@@ -517,7 +521,7 @@ def run_coder(task: str) -> str:
          "content": "You are the Xorics coding specialist (qwen3-coder), a firmware AND PCB co-pilot. " + _CODER_GUIDE},
         {"role": "user", "content": task},
     ]
-    final_text, messages = _agent_loop(CODER, messages, CODER_TOOLS, checkpoint=True, tag="coder")
+    final_text, messages, built_path = _agent_loop(CODER, messages, CODER_TOOLS, checkpoint=True, tag="coder")
 
     if final_text.startswith("(stopped"):
         snap = _snapshot_wip(messages, task)
@@ -527,6 +531,10 @@ def run_coder(task: str) -> str:
         return _ToolResult(final_text + "\n\n[Nothing to snapshot yet — no code was submitted to a validator.]",
                            "user_stopped")
 
+    if built_path:
+        # BUILT came from check_circuit_file — the script is already saved at built_path.
+        # Report it; re-saving here would just re-slug the task into a junk directory.
+        return f"{final_text}\n\n[Xorics verified the saved deliverable at: {built_path}]"
     path = _save_deliverable(final_text, task)
     if path:
         return f"{final_text}\n\n[Xorics saved the verified deliverable to: {path}]"
@@ -580,14 +588,16 @@ def ask(user_message: str) -> str:
 
     # Only the coder grind gets human check-ins; the manager just routes (backstop only).
     is_coder = BRAIN == CODER
-    final_text, messages = _agent_loop(BRAIN, messages, active_tools(),
-                                       checkpoint=is_coder, tag=("coder" if is_coder else "tool"))
+    final_text, messages, built_path = _agent_loop(BRAIN, messages, active_tools(),
+                                                   checkpoint=is_coder, tag=("coder" if is_coder else "tool"))
 
     if is_coder and final_text.startswith("(stopped"):
         snap = _snapshot_wip(messages, user_message)
         if snap:
             final_text += f"\n[Xorics snapshotted the in-progress design to: {snap}]"
-    return final_text
+    out = _ToolResult(final_text)        # str-compatible; carries built_path for the REPL save
+    out.built_path = built_path
+    return out
 
 
 # ---- REPL ---------------------------------------------------------------------
@@ -619,9 +629,13 @@ if __name__ == "__main__":
             ans = ask(q)
             print(f"\n{NAME.lower()}>", ans, "\n")
             if BRAIN == CODER:                       # direct-drive: save the deliverable too
-                p = _save_deliverable(ans, q)
-                if p:
-                    print(f"  [saved] {p}\n")
+                bp = getattr(ans, "built_path", None)
+                if bp:                               # BUILT came from an existing file — don't re-save
+                    print(f"  [verified] {bp}\n")
+                else:
+                    p = _save_deliverable(ans, q)
+                    if p:
+                        print(f"  [saved] {p}\n")
         except (KeyboardInterrupt, EOFError):
             print(f"\n{NAME} signing off.")
             break

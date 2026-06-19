@@ -90,7 +90,7 @@ try:
                  ["V3", [["U1", "2", "VO"], ["C2", "1", ""]]],
                  ["GND", [["U1", "1", "GND"], ["C1", "2", ""], ["C2", "2", ""]]]],
         "parts": [["U1", "AMS1117-3.3", "Regulator_Linear",
-                   [["1", "GND"], ["2", "VO"], ["3", "VI"]], "Package_SO:SOIC-8"],
+                   [["1", "GND"], ["2", "VO"], ["3", "VI"]], "Package_SO:SOIC-8_5.2x6.2mm_Pitch1.27mm"],
                   ["C1", "C", "Device", [["1", ""], ["2", ""]], "Cap:0603"],
                   ["C2", "C", "Device", [["1", ""], ["2", ""]], "Cap:0603"]],
     }
@@ -121,6 +121,70 @@ check("old 4-field record -> empty footprint", nq.footprints(d4) == {"U1": ""})
 check("parts() still works on 5-field record",
       [r[0] for r in nq.parts(d5)] == ["U1"])
 
+print()
+
+
+# ---- 5) footprint NAME resolution — the hallucinated-name catch ------------
+# Reuses the real Package_SO.pretty built in section 1 (KICAD_FOOTPRINT_DIR=tmp),
+# which contains exactly one file: SOIC-8_5.2x6.2mm_Pitch1.27mm.kicad_mod.
+print("_resolve_footprint")
+REAL = "Package_SO:SOIC-8_5.2x6.2mm_Pitch1.27mm"
+check("real file -> ok", pcb._resolve_footprint(REAL)[0] == "ok")
+check("  ok returns a real path", os.path.exists(pcb._resolve_footprint(REAL)[1] or ""))
+# library present, name absent -> coder hallucinated/typo'd a name in a REAL library
+check("real lib, fake-but-plausible name -> bad_name",
+      pcb._resolve_footprint("Package_SO:SOIC-8_5.3x6.2mm_P1.27mm")[0] == "bad_name")
+check("real lib, clearly fake name -> bad_name",
+      pcb._resolve_footprint("Package_SO:DefinitelyNotReal_xyz")[0] == "bad_name")
+# whole library missing -> can't tell fake from not-installed -> degrade
+check("missing library -> unknown",
+      pcb._resolve_footprint("Zzz_No_Such_Lib:Whatever")[0] == "unknown")
+check("no colon -> malformed", pcb._resolve_footprint("bare")[0] == "malformed")
+check("empty name side -> malformed", pcb._resolve_footprint("Lib:")[0] == "malformed")
+check("empty -> malformed", pcb._resolve_footprint("")[0] == "malformed")
+# the pad helper degrades (None) on every non-'ok' status
+check("pad helper: fake name -> None", pcb._footprint_pad_numbers("Package_SO:Nope_xyz") is None)
+
+print("_footprint_resolution_faults")
+def rboard(parts):
+    return {"nets": [], "parts": parts}
+# fake name under a real library -> FATAL fault, right ref, names the footprint
+bad = rboard([["U1", "AMS1117-3.3", "Regulator_Linear",
+               [["1", "GND"], ["2", "VO"], ["3", "VI"]], "Package_SO:SOT223_FAKE"]])
+fa, wa = pcb._footprint_resolution_faults(bad)
+check("fake name -> fault", len(fa) == 1 and "U1" in fa[0] and "SOT223_FAKE" in fa[0])
+check("  fault says it won't import", "import" in fa[0].lower() and "does not exist" in fa[0])
+check("fake name -> no warning", wa == [])
+# malformed footprint string -> fault
+mal = rboard([["U2", "X", "Lib", [["1", ""]], "no_colon_here"]])
+fm, _ = pcb._footprint_resolution_faults(mal)
+check("malformed -> fault", len(fm) == 1 and "U2" in fm[0])
+# unknown library -> degrades silently by default
+unk = rboard([["U3", "X", "Lib", [["1", ""]], "Zzz_No_Such_Lib:Whatever"]])
+check("unknown lib -> silent by default", pcb._footprint_resolution_faults(unk) == ([], []))
+# ...and surfaces as a WARNING (never a fault) when the toggle is on
+pcb.WARN_ON_UNKNOWN_FOOTPRINT_LIB = True
+fu, wu = pcb._footprint_resolution_faults(unk)
+check("unknown lib -> warning when toggled on", fu == [] and len(wu) == 1 and "U3" in wu[0])
+pcb.WARN_ON_UNKNOWN_FOOTPRINT_LIB = False
+# a real footprint -> clean
+okb = rboard([["U4", "X", "Package_SO", [["1", ""]], REAL]])
+check("resolving footprint -> clean", pcb._footprint_resolution_faults(okb) == ([], []))
+print()
+
+
+# ---- 6) _decide: a hallucinated footprint name FAILS the build -------------
+print("_decide (hallucinated footprint name)")
+HALLUC = {
+    "nets": [["VBUS", [["U1", "3", "VI"]]],
+             ["V3", [["U1", "2", "VO"]]],
+             ["GND", [["U1", "1", "GND"]]]],
+    "parts": [["U1", "AMS1117-3.3", "Regulator_Linear",
+               [["1", "GND"], ["2", "VO"], ["3", "VI"]], "Package_SO:SOT223_FAKE"]],
+}
+r = pcb._decide(0, True, HALLUC, "", "", "")
+check("fake footprint name -> FAILED", r.status == "failed")
+check("  reported as a footprint fault", "Footprint faults" in r and "does not exist" in r)
 print()
 print(f"==== {_p} passed, {_f} failed ====")
 raise SystemExit(1 if _f else 0)
