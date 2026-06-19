@@ -53,7 +53,7 @@ from datasheet_rag import search_datasheets        # RAG retrieval (:8082)
 from web_datasheets import fetch_datasheet          # web -> index a datasheet PDF
 from firmware_tools import compile_check, save_sketch
 from notebook import Notebook                                              # XORICS-FEATURE: coder-notebook
-from pcb_tools import check_circuit, check_circuit_file, find_part, part_pins, save_circuit   # SKiDL: search + run ERC
+from pcb_tools import check_circuit, check_circuit_file, find_part, find_footprint, part_pins, save_circuit   # SKiDL: search + run ERC
 
 
 class _ToolResult(str):
@@ -228,6 +228,16 @@ TOOLS = [
             "name": {"type": "string", "description": "Exact symbol name, e.g. 'AMS1117-3.3'."}},
             "required": ["library", "name"]}}},
     {"type": "function", "function": {
+        "name": "find_footprint",
+        "description": "Search the KiCad FOOTPRINT libraries for the exact 'Library:Footprint' to "
+                       "put in Part(..., footprint='Library:Footprint'). Use this instead of "
+                       "guessing a footprint name — a name that doesn't exist fails the build. "
+                       "Pass pins=<the part's pin count> to list footprints whose pads match first.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Footprint family/keyword, e.g. 'SOT-223', '0603', 'SOIC-8', 'USB_C'."},
+            "pins": {"type": "integer", "description": "Optional. The part's pin count; footprints with that many pads are listed first."}},
+            "required": ["query"]}}},
+    {"type": "function", "function": {
         "name": "check_circuit",
         "description": "Run a SKiDL circuit script (Python) to electrically validate a PCB design: it "
                        "executes the script, runs ERC, and generates a KiCad netlist; returns whether it "
@@ -276,6 +286,7 @@ MANAGER_TOOLS = [t for t in TOOLS if t["function"]["name"]
 # Coder's own toolset (used inside delegate_to_coder and in manual /code mode).
 CODER_TOOLS = [t for t in TOOLS if t["function"]["name"]
                in ("compile_check", "check_circuit", "check_circuit_file", "find_part", "part_pins",
+                   "find_footprint",
                    "search_datasheets", "fetch_datasheet", "web_search", "read_file")]
 
 
@@ -303,6 +314,8 @@ _CODER_GUIDE = (
     "KiCad symbol names differ ('VI' not 'VIN'; 'IO0' not 'GPIO0'). For a listed part other than the "
     "top match, call part_pins(library, name) to get its real pins. A 'No pins found' error means the "
     "pin name is wrong, NOT the part — fix the name from find_part/part_pins, don't re-search the part.\n"
+    "- FOOTPRINTS: don't guess the name. Call find_footprint('SOT-223', pins=<part's pin count>) to get a "
+    "REAL 'Library:Footprint'; its pads must cover the part's pins. A made-up footprint name fails the build.\n"
     "- A power-only USB-C needs only VBUS + GND (plus CC1/CC2 with 5.1k pulldowns); don't agonize over 24 pins.\n"
     "- POWER DOMAINS are SEPARATE nets: USB VBUS (5V) and the 3V3 rail are different Nets — never the "
     "same one. A regulator converts between them, so its input and output are different nets: "
@@ -559,6 +572,7 @@ TOOL_IMPLS = {
     "check_circuit_file": check_circuit_file,
     "read_file": read_file,
     "find_part": find_part,
+    "find_footprint": find_footprint,
     "part_pins": part_pins,
     "delegate_to_coder": delegate_to_coder,
 }

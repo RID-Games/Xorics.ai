@@ -1094,3 +1094,80 @@ def save_circuit(code: str, name: str = "circuit") -> str:
     path = d / f"{slug}.py"
     path.write_text(code)
     return str(path)
+
+
+def _all_footprints():
+    """[(lib, name), ...] for every installed footprint (<dir>/<lib>.pretty/<name>.kicad_mod).
+    Names only — no file reads — so this stays cheap across thousands of footprints. First
+    footprint dir wins on a duplicate lib name (matches _resolve_footprint's search order)."""
+    seen, out = set(), []
+    for base in _footprint_dirs():
+        try:
+            entries = os.listdir(base)
+        except OSError:
+            continue
+        for d in entries:
+            if not d.endswith(".pretty"):
+                continue
+            lib = d[:-len(".pretty")]
+            if lib in seen:
+                continue
+            seen.add(lib)
+            try:
+                files = os.listdir(os.path.join(base, d))
+            except OSError:
+                continue
+            out += [(lib, fn[:-len(".kicad_mod")]) for fn in files if fn.endswith(".kicad_mod")]
+    return out
+
+
+def find_footprint(query: str, pins: int = 0) -> str:
+    """Search the installed KiCad footprint libraries for REAL, loadable footprints matching
+    `query`, returned as exact 'Library:Footprint' strings — what goes straight into
+    Part(..., footprint='Library:Footprint'). The footprint twin of find_part: look the name
+    up here instead of guessing it (a guessed name that doesn't exist fails the build). Pure
+    filesystem lookup, no SKiDL needed.
+
+    If `pins` > 0, footprints whose pad COUNT equals it are listed first — the footprint's pads
+    must cover the part's pins, so this points right at the usable choices."""
+    q_tokens = set(_tokenize(query))
+    if not q_tokens:
+        return ("find_footprint needs a search term, e.g. find_footprint('SOT-223') or "
+                "find_footprint('0603').")
+    cands = _all_footprints()
+    if not cands:
+        return ("No footprint libraries found (looked in: " + ", ".join(_footprint_dirs())
+                + "). Is KiCad's footprint set installed?")
+    q_norm = "".join(_tokenize(query))
+
+    pool = []
+    for lib, name in cands:
+        toks = set(_tokenize(f"{lib} {name}"))
+        if (q_tokens & toks) or (q_norm in "".join(_tokenize(f"{lib} {name}"))):
+            pool.append((f"{lib}:{name}", f"{lib} {name}"))
+    if not pool:
+        return (f"No footprint matched '{query}'. Try a footprint-family term like 'SOT-223', "
+                f"'0603', 'SOIC-8', 'USB_C', or 'Conn_01x04'.")
+
+    ranked = _rank_candidates(query, pool, [c for _id, c in pool])
+    top = [fid for fid, _c in ranked[:12]]
+    padcount = {fid: (len(_footprint_pad_numbers(fid) or ()) or None) for fid in top}
+
+    def fmt(fid):
+        n = padcount.get(fid)
+        return f"  {fid}" + (f"   ({n} pads)" if n else "")
+
+    if pins > 0:
+        match = [f for f in top if padcount.get(f) == pins]
+        rest = [f for f in top if f not in match]
+        lines = [f"Footprints for '{query}' (need {pins} pads — pads must cover the part's pins):"]
+        lines += ([fmt(f) for f in match] if match
+                  else [f"  (none with exactly {pins} pads among the top matches — nearest below)"])
+        if rest:
+            lines.append("Other close matches:")
+            lines += [fmt(f) for f in rest[:6]]
+    else:
+        lines = [f"Footprints for '{query}' (use EXACTLY as written in footprint='...'):"]
+        lines += [fmt(f) for f in top]
+    lines.append("Then set it on the part: Part('<lib>','<name>', footprint='<Library:Footprint>').")
+    return "\n".join(lines)
