@@ -51,8 +51,6 @@ sketches/
 *.erc
 # snapshots of in-progress designs
 wip/
-# conversation memory store (manager /chat transcript; per-machine, regenerated)
-state/
 
 # ── RAG / datasheet index (generated) ──
 rag_index/
