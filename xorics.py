@@ -617,25 +617,51 @@ def active_tools():
     return CODER_TOOLS if BRAIN == CODER else MANAGER_TOOLS
 
 
+# ---- Conversation memory ------------------------------------------------------
+# The manager (/chat) keeps a running transcript so it remembers earlier turns
+# instead of cold-starting every message. Only clean user/assistant pairs are kept
+# — never the coder's internal grind or raw tool scaffolding — so context stays
+# compact and the coder/grader path is completely unaffected. In-memory and
+# per-process for now; cross-session persistence (campaign files, etc.) comes later.
+_CHAT_HISTORY = []
+CHAT_HISTORY_MSGS = 16   # retain this many recent user/assistant messages (~8 exchanges)
+
+def _remember(user_message, reply):
+    _CHAT_HISTORY.append({"role": "user", "content": user_message})
+    _CHAT_HISTORY.append({"role": "assistant", "content": reply})
+    if len(_CHAT_HISTORY) > CHAT_HISTORY_MSGS:        # keep it inside the model's window
+        del _CHAT_HISTORY[:len(_CHAT_HISTORY) - CHAT_HISTORY_MSGS]
+
+def reset_history():
+    _CHAT_HISTORY.clear()
+
+
 # ---- The agent loop -----------------------------------------------------------
 def ask(user_message: str) -> str:
-    if BRAIN == CODER:
+    is_coder = BRAIN == CODER
+    if is_coder:
         system = f"You are {NAME}, the coding specialist, in manual coding mode. " + _CODER_GUIDE
+        # Coder mode is task-scoped: each request is its own deliverable, no transcript.
+        messages = [{"role": "system", "content": system},
+                    {"role": "user", "content": user_message}]
     else:
         system = _MANAGER_PERSONA + "\n\n" + _MANAGER_ROUTING
-
-    messages = [{"role": "system", "content": system},
-                {"role": "user", "content": user_message}]
+        # Manager mode carries the conversation so earlier turns are remembered.
+        messages = [{"role": "system", "content": system},
+                    *_CHAT_HISTORY,
+                    {"role": "user", "content": user_message}]
 
     # Only the coder grind gets human check-ins; the manager just routes (backstop only).
-    is_coder = BRAIN == CODER
     final_text, messages, built_path = _agent_loop(BRAIN, messages, active_tools(),
                                                    checkpoint=is_coder, tag=("coder" if is_coder else "tool"))
 
-    if is_coder and final_text.startswith("(stopped"):
-        snap = _snapshot_wip(messages, user_message)
-        if snap:
-            final_text += f"\n[Xorics snapshotted the in-progress design to: {snap}]"
+    if is_coder:
+        if final_text.startswith("(stopped"):
+            snap = _snapshot_wip(messages, user_message)
+            if snap:
+                final_text += f"\n[Xorics snapshotted the in-progress design to: {snap}]"
+    else:
+        _remember(user_message, final_text)   # only the manager accrues a transcript
     out = _ToolResult(final_text)        # str-compatible; carries built_path for the REPL save
     out.built_path = built_path
     return out
@@ -649,7 +675,7 @@ if __name__ == "__main__":
         sys.exit()
 
     print(f"{NAME} — local AI. The manager delegates coding to the coder automatically.")
-    print("commands: /code (drive coder directly)  /chat (manager)  Ctrl+C quit")
+    print("commands: /code (drive coder directly)  /chat (manager)  /reset (clear memory)  Ctrl+C quit")
     print(f"coder pauses every {CHECKPOINT_EVERY} steps to check in (no cap); backstop {CODER_BACKSTOP} when unattended.\n")
     while True:
         try:
@@ -667,6 +693,9 @@ if __name__ == "__main__":
                 q = q[5:].strip()
                 if not q:
                     continue
+            elif q == "/reset" or q == "/new":
+                reset_history(); print("→ conversation cleared — fresh context\n")
+                continue
             ans = ask(q)
             print(f"\n{NAME.lower()}>", ans, "\n")
             if BRAIN == CODER:                       # direct-drive: save the deliverable too
