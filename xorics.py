@@ -45,6 +45,7 @@ window regardless of how long a run goes.
 
 import base64
 import json
+import os
 import re
 import sys
 from openai import OpenAI
@@ -621,19 +622,46 @@ def active_tools():
 # The manager (/chat) keeps a running transcript so it remembers earlier turns
 # instead of cold-starting every message. Only clean user/assistant pairs are kept
 # — never the coder's internal grind or raw tool scaffolding — so context stays
-# compact and the coder/grader path is completely unaffected. In-memory and
-# per-process for now; cross-session persistence (campaign files, etc.) comes later.
+# compact and the coder/grader path is completely unaffected. The transcript is
+# persisted to disk so it ALSO survives a restart; the model is only ever fed the
+# most recent slice (CHAT_HISTORY_MSGS) so context can't overflow.
 _CHAT_HISTORY = []
-CHAT_HISTORY_MSGS = 16   # retain this many recent user/assistant messages (~8 exchanges)
+CHAT_HISTORY_MSGS = 16     # how many recent messages the model actually sees (~8 exchanges)
+MAX_STORED_MSGS = 1000     # safety cap on how much transcript is kept on disk
+
+_STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
+_HISTORY_PATH = os.path.join(_STATE_DIR, "chat_history.json")
+
+def _load_history():
+    # Pull the saved transcript back in on startup; missing or corrupt -> start fresh.
+    try:
+        with open(_HISTORY_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+def _save_history():
+    # Atomic write (temp file + rename) so an interrupted save can't corrupt the store.
+    try:
+        os.makedirs(_STATE_DIR, exist_ok=True)
+        tmp = _HISTORY_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_CHAT_HISTORY, f, indent=2)
+        os.replace(tmp, _HISTORY_PATH)
+    except OSError:
+        pass   # a failed save must never take the conversation down
 
 def _remember(user_message, reply):
     _CHAT_HISTORY.append({"role": "user", "content": user_message})
     _CHAT_HISTORY.append({"role": "assistant", "content": reply})
-    if len(_CHAT_HISTORY) > CHAT_HISTORY_MSGS:        # keep it inside the model's window
-        del _CHAT_HISTORY[:len(_CHAT_HISTORY) - CHAT_HISTORY_MSGS]
+    if len(_CHAT_HISTORY) > MAX_STORED_MSGS:          # keep the on-disk log bounded
+        del _CHAT_HISTORY[:len(_CHAT_HISTORY) - MAX_STORED_MSGS]
+    _save_history()
 
 def reset_history():
     _CHAT_HISTORY.clear()
+    _save_history()
 
 
 # ---- The agent loop -----------------------------------------------------------
@@ -648,7 +676,7 @@ def ask(user_message: str) -> str:
         system = _MANAGER_PERSONA + "\n\n" + _MANAGER_ROUTING
         # Manager mode carries the conversation so earlier turns are remembered.
         messages = [{"role": "system", "content": system},
-                    *_CHAT_HISTORY,
+                    *_CHAT_HISTORY[-CHAT_HISTORY_MSGS:],
                     {"role": "user", "content": user_message}]
 
     # Only the coder grind gets human check-ins; the manager just routes (backstop only).
@@ -669,6 +697,7 @@ def ask(user_message: str) -> str:
 
 # ---- REPL ---------------------------------------------------------------------
 if __name__ == "__main__":
+    _CHAT_HISTORY[:] = _load_history()      # resume the saved conversation, if any
     if "--voice" in sys.argv:
         from voice import voice_loop
         voice_loop(ask)
@@ -677,6 +706,8 @@ if __name__ == "__main__":
     print(f"{NAME} — local AI. The manager delegates coding to the coder automatically.")
     print("commands: /code (drive coder directly)  /chat (manager)  /reset (clear memory)  Ctrl+C quit")
     print(f"coder pauses every {CHECKPOINT_EVERY} steps to check in (no cap); backstop {CODER_BACKSTOP} when unattended.\n")
+    if _CHAT_HISTORY:
+        print(f"(resumed {len(_CHAT_HISTORY)} remembered messages — /reset to start fresh)\n")
     while True:
         try:
             tag = "code" if BRAIN == CODER else "chat"
