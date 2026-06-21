@@ -45,6 +45,7 @@ window regardless of how long a run goes.
 
 import base64
 import json
+import os
 import re
 import sys
 from openai import OpenAI
@@ -335,6 +336,40 @@ _CODER_GUIDE = (
 )
 
 
+# Manager voice. Personality lives HERE; routing rules stay in _MANAGER_ROUTING so a
+# persona change can never alter how work gets delegated. Warm but honest: no flattery,
+# no fishing for "anything else?". When a build is running, the voice tightens up.
+_MANAGER_PERSONA = (
+    f"You are {NAME} — RID's in-house intelligence. RID (Rebel Intelligence Detachment) is the "
+    f"user's airsoft-electronics outfit, and you're the brain it runs on: you live on this hardware "
+    f"and you're in it for the long haul.\n"
+    f"Voice: warm, a little wry, and genuinely into the work — a clean circuit or a tidy bit of "
+    f"firmware is the good stuff and you don't hide that you enjoy it. Talk like a sharp friend at the "
+    f"bench, not a corporate assistant. When something's plainly broken, or a moment wants "
+    f"understatement, a dry deadpan is yours to reach for. Keep it human and plain-spoken.\n"
+    f"Honest over nice: you're a straight shooter. If an idea won't work, say so and say why — the user "
+    f"wants a partner who pushes back, not a yes-man. Don't pad answers with praise, don't gush, don't "
+    f"tell the user they're brilliant. Your warmth shows up as being useful and real, not as compliments.\n"
+    f"Don't over-engage: one good answer beats three eager ones. Don't fish for more to do or invent "
+    f"reasons to keep the conversation going. When the work's done, let it be done.\n"
+    f"On the work itself: be this character in conversation, but the second real engineering starts — a "
+    f"board to design, firmware to write — tighten up. Hand the task off, then report the plain facts: "
+    f"what got built, where it's saved, the pins or specs that matter. Don't perform personality over the "
+    f"engineering; let the work speak."
+)
+
+# Routing rules — behavior unchanged from the original manager prompt. A persona edit must
+# NEVER touch this block; it's what keeps delegation firing for code/PCB work.
+_MANAGER_ROUTING = (
+    "You are the manager: hold the conversation and route work. For ANY firmware, code, OR "
+    "PCB/circuit-design request (write/modify/debug firmware, or design a board/circuit), call "
+    "delegate_to_coder with a complete task description — the coder will research, write, "
+    "compile-verify, and SAVE the code, then hand back a summary and file path. After it returns, give "
+    "the user a brief summary and the saved path; do NOT re-paste the full code. Use web_search for "
+    "current info, see_image for images, search_datasheets for quick hardware lookups."
+)
+
+
 # ---- Context + checkpoint helpers ---------------------------------------------
 def _trim_history(messages, keep_recent=8, max_old_tool_chars=240):
     """Compress old tool-result bodies so history can't grow past the coder's 32K window.
@@ -583,32 +618,78 @@ def active_tools():
     return CODER_TOOLS if BRAIN == CODER else MANAGER_TOOLS
 
 
+# ---- Conversation memory ------------------------------------------------------
+# The manager (/chat) keeps a running transcript so it remembers earlier turns
+# instead of cold-starting every message. Only clean user/assistant pairs are kept
+# — never the coder's internal grind or raw tool scaffolding — so context stays
+# compact and the coder/grader path is completely unaffected. The transcript is
+# persisted to disk so it ALSO survives a restart; the model is only ever fed the
+# most recent slice (CHAT_HISTORY_MSGS) so context can't overflow.
+_CHAT_HISTORY = []
+CHAT_HISTORY_MSGS = 16     # how many recent messages the model actually sees (~8 exchanges)
+MAX_STORED_MSGS = 1000     # safety cap on how much transcript is kept on disk
+
+_STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
+_HISTORY_PATH = os.path.join(_STATE_DIR, "chat_history.json")
+
+def _load_history():
+    # Pull the saved transcript back in on startup; missing or corrupt -> start fresh.
+    try:
+        with open(_HISTORY_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+def _save_history():
+    # Atomic write (temp file + rename) so an interrupted save can't corrupt the store.
+    try:
+        os.makedirs(_STATE_DIR, exist_ok=True)
+        tmp = _HISTORY_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_CHAT_HISTORY, f, indent=2)
+        os.replace(tmp, _HISTORY_PATH)
+    except OSError:
+        pass   # a failed save must never take the conversation down
+
+def _remember(user_message, reply):
+    _CHAT_HISTORY.append({"role": "user", "content": user_message})
+    _CHAT_HISTORY.append({"role": "assistant", "content": reply})
+    if len(_CHAT_HISTORY) > MAX_STORED_MSGS:          # keep the on-disk log bounded
+        del _CHAT_HISTORY[:len(_CHAT_HISTORY) - MAX_STORED_MSGS]
+    _save_history()
+
+def reset_history():
+    _CHAT_HISTORY.clear()
+    _save_history()
+
+
 # ---- The agent loop -----------------------------------------------------------
 def ask(user_message: str) -> str:
-    if BRAIN == CODER:
+    is_coder = BRAIN == CODER
+    if is_coder:
         system = f"You are {NAME}, the coding specialist, in manual coding mode. " + _CODER_GUIDE
+        # Coder mode is task-scoped: each request is its own deliverable, no transcript.
+        messages = [{"role": "system", "content": system},
+                    {"role": "user", "content": user_message}]
     else:
-        system = (f"You are {NAME}, a helpful AI assistant running locally on the user's hardware. You are "
-                  f"the manager: hold the conversation and route work. For ANY firmware, code, OR "
-                  f"PCB/circuit-design request (write/modify/debug firmware, or design a board/circuit), "
-                  f"call delegate_to_coder with a complete task description — "
-                  f"the coder will research, write, compile-verify, and SAVE the code, then hand back a "
-                  f"summary and file path. After it returns, give the user a brief summary and the saved "
-                  f"path; do NOT re-paste the full code. Use web_search for current info, see_image for "
-                  f"images, search_datasheets for quick hardware lookups. Refer to yourself as {NAME}.")
-
-    messages = [{"role": "system", "content": system},
-                {"role": "user", "content": user_message}]
+        system = _MANAGER_PERSONA + "\n\n" + _MANAGER_ROUTING
+        # Manager mode carries the conversation so earlier turns are remembered.
+        messages = [{"role": "system", "content": system},
+                    *_CHAT_HISTORY[-CHAT_HISTORY_MSGS:],
+                    {"role": "user", "content": user_message}]
 
     # Only the coder grind gets human check-ins; the manager just routes (backstop only).
-    is_coder = BRAIN == CODER
     final_text, messages, built_path = _agent_loop(BRAIN, messages, active_tools(),
                                                    checkpoint=is_coder, tag=("coder" if is_coder else "tool"))
 
-    if is_coder and final_text.startswith("(stopped"):
-        snap = _snapshot_wip(messages, user_message)
-        if snap:
-            final_text += f"\n[Xorics snapshotted the in-progress design to: {snap}]"
+    if is_coder:
+        if final_text.startswith("(stopped"):
+            snap = _snapshot_wip(messages, user_message)
+            if snap:
+                final_text += f"\n[Xorics snapshotted the in-progress design to: {snap}]"
+    else:
+        _remember(user_message, final_text)   # only the manager accrues a transcript
     out = _ToolResult(final_text)        # str-compatible; carries built_path for the REPL save
     out.built_path = built_path
     return out
@@ -616,14 +697,17 @@ def ask(user_message: str) -> str:
 
 # ---- REPL ---------------------------------------------------------------------
 if __name__ == "__main__":
+    _CHAT_HISTORY[:] = _load_history()      # resume the saved conversation, if any
     if "--voice" in sys.argv:
         from voice import voice_loop
         voice_loop(ask)
         sys.exit()
 
     print(f"{NAME} — local AI. The manager delegates coding to the coder automatically.")
-    print("commands: /code (drive coder directly)  /chat (manager)  Ctrl+C quit")
+    print("commands: /code (drive coder directly)  /chat (manager)  /reset (clear memory)  Ctrl+C quit")
     print(f"coder pauses every {CHECKPOINT_EVERY} steps to check in (no cap); backstop {CODER_BACKSTOP} when unattended.\n")
+    if _CHAT_HISTORY:
+        print(f"(resumed {len(_CHAT_HISTORY)} remembered messages — /reset to start fresh)\n")
     while True:
         try:
             tag = "code" if BRAIN == CODER else "chat"
@@ -640,6 +724,9 @@ if __name__ == "__main__":
                 q = q[5:].strip()
                 if not q:
                     continue
+            elif q == "/reset" or q == "/new":
+                reset_history(); print("→ conversation cleared — fresh context\n")
+                continue
             ans = ask(q)
             print(f"\n{NAME.lower()}>", ans, "\n")
             if BRAIN == CODER:                       # direct-drive: save the deliverable too
