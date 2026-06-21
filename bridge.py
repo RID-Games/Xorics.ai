@@ -58,7 +58,7 @@ _TOKEN = os.environ.get("XORICS_BRIDGE_TOKEN")
 
 WHISPER_URL = os.environ.get("XORICS_WHISPER_URL", "http://127.0.0.1:8084/inference")
 KOKORO_URL = os.environ.get("XORICS_KOKORO_URL", "http://127.0.0.1:8880/v1/audio/speech")
-TTS_VOICE = os.environ.get("XORICS_TTS_VOICE", "af_heart")
+TTS_VOICE = os.environ.get("XORICS_TTS_VOICE", "bm_fable")
 
 app = FastAPI(title="Xorics bridge")
 
