@@ -52,15 +52,31 @@ MAX_OUTPUT = 4000                      # cap returned text; errors live at the e
 SKETCH_DIR = Path(os.environ.get("XORICS_SKETCHES", Path.home() / "xorics-ai" / "sketches"))
 
 
-def compile_check(code: str, fqbn: str = DEFAULT_FQBN) -> str:
+class CompileResult(str):
+    """A compile_check result that reads as its normal text for the coder, but also carries a
+    machine-readable .status ('built' | 'failed' | 'timeout' | 'no_toolchain') for the agent loop.
+
+    Same contract as pcb_tools.CheckResult: the loop inspects .status instead of string-matching the
+    human text, so a compiled sketch (status 'built') triggers the BUILT-stop and gets written to the
+    honesty-gate deliverable manifest exactly like a built board. Reword the messages freely.
+    """
+    def __new__(cls, text, status):
+        obj = super().__new__(cls, text)
+        obj.status = status
+        return obj
+
+
+def compile_check(code: str, fqbn: str = DEFAULT_FQBN) -> "CompileResult":
     """
     Compile an Arduino-framework sketch with arduino-cli and report the result.
-    Returns 'COMPILE OK' + usage on success, or 'COMPILE FAILED' + compiler errors.
+    Returns a CompileResult (reads as text, carries .status): 'built' on success (with flash/RAM
+    usage), 'failed' with compiler errors, 'timeout', or 'no_toolchain'. The .status is what lets
+    xorics' loop treat a compiled sketch like a built board (BUILT-stop + deliverable manifest).
     """
     if shutil.which("arduino-cli") is None:
-        return ("arduino-cli not found. Install it, then the ESP32 core:\n"
-                "  arduino-cli core update-index\n"
-                "  arduino-cli core install esp32:esp32")
+        return CompileResult("arduino-cli not found. Install it, then the ESP32 core:\n"
+                             "  arduino-cli core update-index\n"
+                             "  arduino-cli core install esp32:esp32", "no_toolchain")
 
     # arduino-cli expects sketch.ino inside a folder named 'sketch'
     workdir = tempfile.mkdtemp(prefix="xorics_build_")
@@ -75,7 +91,7 @@ def compile_check(code: str, fqbn: str = DEFAULT_FQBN) -> str:
             capture_output=True, text=True, timeout=BUILD_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        return f"COMPILE TIMEOUT: build exceeded {BUILD_TIMEOUT}s."
+        return CompileResult(f"COMPILE TIMEOUT: build exceeded {BUILD_TIMEOUT}s.", "timeout")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -85,8 +101,8 @@ def compile_check(code: str, fqbn: str = DEFAULT_FQBN) -> str:
 
     if proc.returncode == 0:
         # On success arduino-cli prints flash/RAM usage - ground-truth size info.
-        return "COMPILE OK\n" + out
-    return f"COMPILE FAILED (exit {proc.returncode})\n" + out
+        return CompileResult("COMPILE OK\n" + out, "built")
+    return CompileResult(f"COMPILE FAILED (exit {proc.returncode})\n" + out, "failed")
 
 
 def extract_code(text: str) -> str | None:

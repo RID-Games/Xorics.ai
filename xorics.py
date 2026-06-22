@@ -610,7 +610,7 @@ def run_coder(task: str) -> str:
         return f"{final_text}\n\n[Xorics verified the saved deliverable at: {built_path}]"
     path = _save_deliverable(final_text, task)
     if path and outcome["built"]:               # honesty-gate: only record a file a validator passed
-        _record_deliverable(path, "check_circuit")
+        _record_deliverable(path, "compile_check" if str(path).endswith(".ino") else "check_circuit")
     if path:
         return f"{final_text}\n\n[Xorics saved the verified deliverable to: {path}]"
     return final_text + "\n\n[No code block found to save as a file.]"
