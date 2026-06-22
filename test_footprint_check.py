@@ -133,7 +133,7 @@ check("real file -> ok", pcb._resolve_footprint(REAL)[0] == "ok")
 check("  ok returns a real path", os.path.exists(pcb._resolve_footprint(REAL)[1] or ""))
 # library present, name absent -> coder hallucinated/typo'd a name in a REAL library
 check("real lib, fake-but-plausible name -> bad_name",
-      pcb._resolve_footprint("Package_SO:SOIC-8_5.3x6.2mm_P1.27mm")[0] == "bad_name")
+      pcb._resolve_footprint("Package_SO:SOIC-8_5.3x6.2mm_P9.99mm")[0] == "bad_name")
 check("real lib, clearly fake name -> bad_name",
       pcb._resolve_footprint("Package_SO:DefinitelyNotReal_xyz")[0] == "bad_name")
 # whole library missing -> can't tell fake from not-installed -> degrade
