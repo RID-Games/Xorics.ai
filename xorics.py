@@ -48,6 +48,7 @@ import json
 import os
 import re
 import sys
+import time
 from openai import OpenAI
 
 from datasheet_rag import search_datasheets        # RAG retrieval (:8082)
@@ -279,16 +280,31 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "task": {"type": "string", "description": "Full, self-contained coding task description."}},
             "required": ["task"]}}},
+    {"type": "function", "function": {
+        "name": "finalize_design",
+        "description": "Call this BEFORE telling the user a design is COMPLETE. Pass the file paths you "
+                       "are claiming as deliverables. It verifies a board actually BUILT this session and "
+                       "every claimed file exists on disk and passed a validator, and returns VERIFIED or "
+                       "CANNOT FINALIZE. Do NOT claim a design is done without a VERIFIED result.",
+        "parameters": {"type": "object", "properties": {
+            "paths": {"type": "array", "items": {"type": "string"},
+                      "description": "Full paths of the files you are claiming as finished deliverables."}},
+            "required": []}}},
 ]
 
 # Manager (gpt-oss) routes + delegates; it does NOT compile directly.
 MANAGER_TOOLS = [t for t in TOOLS if t["function"]["name"]
-                 in ("web_search", "see_image", "search_datasheets", "delegate_to_coder")]
+                 in ("web_search", "see_image", "search_datasheets", "delegate_to_coder",
+                     "finalize_design")]
 # Coder's own toolset (used inside delegate_to_coder and in manual /code mode).
 CODER_TOOLS = [t for t in TOOLS if t["function"]["name"]
                in ("compile_check", "check_circuit", "check_circuit_file", "find_part", "part_pins",
                    "find_footprint",
                    "search_datasheets", "fetch_datasheet", "web_search", "read_file")]
+
+# A turn that fires any of these attempted a design/build — used to scope the honesty-gate
+# footer so it never fires on plain chat. XORICS-FEATURE: honesty-gate
+_DESIGN_TOOLS = {"delegate_to_coder", "check_circuit", "check_circuit_file", "compile_check"}
 
 
 # Shared coder guidance (used by delegation and manual /code), tuned to avoid thrashing.
@@ -366,7 +382,10 @@ _MANAGER_ROUTING = (
     "delegate_to_coder with a complete task description — the coder will research, write, "
     "compile-verify, and SAVE the code, then hand back a summary and file path. After it returns, give "
     "the user a brief summary and the saved path; do NOT re-paste the full code. Use web_search for "
-    "current info, see_image for images, search_datasheets for quick hardware lookups."
+    "current info, see_image for images, search_datasheets for quick hardware lookups. "
+    "Before you tell the user a design is COMPLETE, call finalize_design with the file paths you are "
+    "claiming — it verifies a board actually built and the files exist. Never report a design as done, "
+    "and never report file paths, without a VERIFIED result from finalize_design."
 )
 
 
@@ -477,6 +496,8 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
     interactive = checkpoint and sys.stdin.isatty()
     final_text = "(no final message)"
     built_path = None                            # set iff BUILT came from a file path
+    built_happened = False                       # any validator returned BUILT this loop  (honesty-gate)
+    design_attempt = False                       # any design/validation tool fired (footer scope)
     # XORICS-FEATURE: coder-notebook -- externalized resolved-parts memory + dedup guard
     notebook = Notebook(task=messages[1]["content"]) if tag == "coder" and len(messages) > 1 else None
     base_system = messages[0]["content"]
@@ -511,6 +532,8 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
         stopped_msg = None                       # XORICS-FEATURE: coder-control
         for tc in msg.tool_calls:
             name = tc.function.name
+            if name in _DESIGN_TOOLS:            # honesty-gate: this turn attempted a design/build
+                design_attempt = True
             args = {}
             try:
                 args = json.loads(tc.function.arguments or "{}")
@@ -533,6 +556,7 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
             # Structured success: check_circuit told us it BUILT (via .status, not text-matching).
             # Capture the exact script that passed so a later edit can't overwrite the win.
             if getattr(result, "status", None) == "built":
+                built_happened = True            # honesty-gate: a real BUILT verdict landed
                 built_code = args.get("code")
                 if built_code is None and args.get("path"):
                     # check_circuit_file validates a SAVED script by PATH, so there's no inline
@@ -558,7 +582,7 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
                 "verified design (further edits are disabled so a passing board can't be broken).\n\n"
                 "```python\n" + (built_code or "") + "\n```")
             break
-    return final_text, messages, built_path
+    return final_text, messages, built_path, {"built": built_happened, "design_attempt": design_attempt}
 
 
 # ---- The coder sub-session (runs on the coder brain, returns a saved file) -----
@@ -569,7 +593,7 @@ def run_coder(task: str) -> str:
          "content": "You are the Xorics coding specialist (qwen3-coder), a firmware AND PCB co-pilot. " + _CODER_GUIDE},
         {"role": "user", "content": task},
     ]
-    final_text, messages, built_path = _agent_loop(CODER, messages, CODER_TOOLS, checkpoint=True, tag="coder")
+    final_text, messages, built_path, outcome = _agent_loop(CODER, messages, CODER_TOOLS, checkpoint=True, tag="coder")
 
     if final_text.startswith("(stopped"):
         snap = _snapshot_wip(messages, task)
@@ -582,8 +606,11 @@ def run_coder(task: str) -> str:
     if built_path:
         # BUILT came from check_circuit_file — the script is already saved at built_path.
         # Report it; re-saving here would just re-slug the task into a junk directory.
+        _record_deliverable(built_path, "check_circuit_file")   # honesty-gate: verified to disk
         return f"{final_text}\n\n[Xorics verified the saved deliverable at: {built_path}]"
     path = _save_deliverable(final_text, task)
+    if path and outcome["built"]:               # honesty-gate: only record a file a validator passed
+        _record_deliverable(path, "check_circuit")
     if path:
         return f"{final_text}\n\n[Xorics saved the verified deliverable to: {path}]"
     return final_text + "\n\n[No code block found to save as a file.]"
@@ -662,6 +689,89 @@ def _remember(user_message, reply):
 def reset_history():
     _CHAT_HISTORY.clear()
     _save_history()
+    _clear_deliverables()                        # honesty-gate: fresh session
+
+
+# ---- Honesty gate: verified-deliverable manifest + finalize --------------------
+# "Done" is mechanical, not narrated: a design is finished only if a board actually BUILT this
+# session AND every claimed file exists on disk. The manifest (written only when a build is
+# verified) is the single source of truth; finalize_design checks it, and ask() appends a
+# machine-generated footer so the manager can't report success/paths that never happened.
+# Mirrors CheckResult.status — structured, not text-matched. XORICS-FEATURE: honesty-gate
+def _deliverables_path():
+    return os.path.join(_STATE_DIR, "deliverables.json")
+
+def _load_deliverables():
+    try:
+        with open(_deliverables_path()) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+def _clear_deliverables():
+    try:
+        if os.path.exists(_deliverables_path()):
+            os.remove(_deliverables_path())
+    except Exception:
+        pass
+
+def _record_deliverable(path, validator):
+    """Append a VERIFIED deliverable to the session manifest (atomic). Only called after a build passes."""
+    rec = {"path": os.path.abspath(os.path.expanduser(str(path))), "validator": validator, "ts": time.time()}
+    data = _load_deliverables()
+    data.append(rec)
+    try:
+        os.makedirs(_STATE_DIR, exist_ok=True)
+        tmp = _deliverables_path() + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, _deliverables_path())
+    except Exception as e:
+        print(f"  [manifest] could not record deliverable: {e}")
+    return rec
+
+def finalize_design(paths=None):
+    """Honesty gate (manager-facing). A design is finished only if a board BUILT this session AND every
+    claimed file exists on disk and passed a validator. Returns VERIFIED / CANNOT FINALIZE with a
+    .status the manager loop can't fake. XORICS-FEATURE: honesty-gate"""
+    paths = [p for p in (paths or []) if str(p).strip()]
+    manifest = _load_deliverables()
+    if not manifest:
+        return _ToolResult("CANNOT FINALIZE — no BUILT verdict on record this session. Nothing has passed "
+                           "check_circuit / check_circuit_file, so there is no verified design to finalize. "
+                           "Delegate the build and get a BUILT result first.", "unverified")
+    verified = {r["path"] for r in manifest}
+    missing = [p for p in paths if not os.path.exists(os.path.expanduser(p))]
+    if missing:
+        return _ToolResult("CANNOT FINALIZE — these claimed files do not exist on disk: "
+                           + ", ".join(missing) + ". Only claim files that were actually written.",
+                           "unverified")
+    unvalidated = [p for p in paths if os.path.abspath(os.path.expanduser(p)) not in verified]
+    if unvalidated:
+        return _ToolResult("CANNOT FINALIZE — these files exist but never passed a validator this session: "
+                           + ", ".join(unvalidated) + ". Run them through check_circuit_file first.",
+                           "unverified")
+    listing = "\n".join(f"  - {r['path']}  [{r['validator']}]" for r in manifest)
+    return _ToolResult("VERIFIED — a board BUILT this session and every claimed file exists on disk.\n"
+                       "Verified deliverables:\n" + listing, "verified")
+
+TOOL_IMPLS["finalize_design"] = finalize_design   # register now that it's defined
+
+def _append_manifest_footer(text, outcome, deliv_before):
+    """Machine-generated truth footer. Fires only on design turns, reporting whether a board actually
+    verified to disk THIS turn — so a fabricated 'complete' is visibly contradicted by ground truth.
+    XORICS-FEATURE: honesty-gate"""
+    if not (outcome or {}).get("design_attempt"):
+        return text
+    fresh = _load_deliverables()[deliv_before:]
+    on_disk = [r for r in fresh if os.path.exists(os.path.expanduser(r["path"]))]
+    if on_disk:
+        files = ", ".join(os.path.basename(r["path"]) for r in on_disk)
+        return text + "\n\n\u2713 VERIFIED — a board BUILT this turn; verified on disk: " + files
+    return text + ("\n\n\u26a0 UNVERIFIED — a design task ran but nothing passed a validator and no new "
+                   "file was verified to disk this turn. Any 'complete' claim or file paths above are "
+                   "unconfirmed.")
 
 
 # ---- The agent loop -----------------------------------------------------------
@@ -680,7 +790,8 @@ def ask(user_message: str) -> str:
                     {"role": "user", "content": user_message}]
 
     # Only the coder grind gets human check-ins; the manager just routes (backstop only).
-    final_text, messages, built_path = _agent_loop(BRAIN, messages, active_tools(),
+    _deliv_before = len(_load_deliverables())    # honesty-gate: footer diffs deliverables added this turn
+    final_text, messages, built_path, outcome = _agent_loop(BRAIN, messages, active_tools(),
                                                    checkpoint=is_coder, tag=("coder" if is_coder else "tool"))
 
     if is_coder:
@@ -689,6 +800,7 @@ def ask(user_message: str) -> str:
             if snap:
                 final_text += f"\n[Xorics snapshotted the in-progress design to: {snap}]"
     else:
+        final_text = _append_manifest_footer(final_text, outcome, _deliv_before)   # honesty gate
         _remember(user_message, final_text)   # only the manager accrues a transcript
     out = _ToolResult(final_text)        # str-compatible; carries built_path for the REPL save
     out.built_path = built_path
