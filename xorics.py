@@ -338,7 +338,7 @@ MANAGER_TOOLS = [t for t in TOOLS if t["function"]["name"]
                      "finalize_design")]
 # Coder's own toolset (used inside delegate_to_coder and in manual /code mode).
 CODER_TOOLS = [t for t in TOOLS if t["function"]["name"]
-               in ("compile_check", "check_circuit", "check_circuit_file", "validate_circuit",
+               in ("compile_check", "check_circuit_file", "validate_circuit",
                    "find_part", "part_pins", "find_footprint",
                    "search_datasheets", "fetch_datasheet", "web_search", "read_file")]
 
