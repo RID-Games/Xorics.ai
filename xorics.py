@@ -44,6 +44,7 @@ window regardless of how long a run goes.
 """
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -85,6 +86,32 @@ def extract_code(text: str) -> str | None:
     blocks = re.findall(r"```[a-zA-Z0-9_+\-]*\s*\n?(.*?)```", text, re.DOTALL)
     blocks = [b.strip() for b in blocks if b.strip()]
     return max(blocks, key=len) if blocks else None
+
+
+def _validate_circuit_from_turn(content: str, name: str):
+    """Body of the validate_circuit tool, kept standalone so it stays hermetically testable.
+
+    Why this exists: the coder can emit a multi-KB SKiDL script as a fenced ```python block in
+    its message CONTENT, but cannot reliably JSON-escape that same script into a tool-call
+    argument — past ~1 KB the arguments JSON breaks ('missing closing quote') and check_circuit
+    never even runs. So validate_circuit does NOT take the script inline: it pulls the script
+    from THIS turn's fenced block, saves it to circuits/<name>/<name>.py, and validates by PATH
+    via check_circuit_file (which reuses the agent loop's BUILT-by-path capture).
+
+    Returns (result, saved_path). `result` is whatever check_circuit_file returns (the
+    status-carrying CheckResult); `saved_path` is the file it wrote. When the turn carries no
+    fenced block it returns (corrective_message, None) and writes nothing — it never silently
+    reaches back to an OLDER fence, which could validate a stale draft. XORICS-FEATURE: validate-from-fence
+    """
+    code = extract_code(content or "")
+    if not code:
+        return (("[validate_circuit: no fenced ```python block in this message. Put the COMPLETE "
+                 "SKiDL script in ONE ```python block in the SAME message as the validate_circuit "
+                 "call, then call it again. Do NOT paste the script into the tool arguments — that "
+                 "is exactly what truncates on a large board.]"), None)
+    saved = save_circuit(code, name=name or "circuit")
+    return (check_circuit_file(saved), saved)
+
 
 NAME = "Xorics"
 MANAGER = "gpt-oss"
@@ -255,11 +282,24 @@ TOOLS = [
                        "back in: reads the file, runs the script + ERC + netlist, returns built/failed "
                        "with the ERC report and errors. Use to check or repair an existing "
                        "circuits/<name>/<name>.py. After seeing errors, fix the design by calling "
-                       "check_circuit with the corrected code inline.",
+                       "validate_circuit with the corrected FULL script in a fenced ```python block.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "Full path to a saved SKiDL .py, e.g. "
                      "~/xorics-ai/circuits/<name>/<name>.py."}},
             "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "validate_circuit",
+        "description": "Validate a NEW SKiDL board you just wrote. Put the COMPLETE SKiDL Python "
+                       "script in ONE fenced ```python block IN THE SAME MESSAGE as this call, then "
+                       "call validate_circuit. It saves that exact script to circuits/<name>/<name>.py "
+                       "and runs it (ERC + netlist), returning built/failed with the errors. This is "
+                       "THE way to validate a fresh board — do NOT paste the script into a tool "
+                       "argument (a large script gets truncated there and never runs). The script must "
+                       "end with ERC() and generate_netlist().",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "Short slug for the board, e.g. "
+                     "'g2_ambient_sensor'; becomes the saved file circuits/<name>/<name>.py."}},
+            "required": ["name"]}}},
     {"type": "function", "function": {
         "name": "read_file",
         "description": "Read a local text file by PATH and return its contents. Use when the user "
@@ -298,13 +338,13 @@ MANAGER_TOOLS = [t for t in TOOLS if t["function"]["name"]
                      "finalize_design")]
 # Coder's own toolset (used inside delegate_to_coder and in manual /code mode).
 CODER_TOOLS = [t for t in TOOLS if t["function"]["name"]
-               in ("compile_check", "check_circuit", "check_circuit_file", "find_part", "part_pins",
-                   "find_footprint",
+               in ("compile_check", "check_circuit", "check_circuit_file", "validate_circuit",
+                   "find_part", "part_pins", "find_footprint",
                    "search_datasheets", "fetch_datasheet", "web_search", "read_file")]
 
 # A turn that fires any of these attempted a design/build — used to scope the honesty-gate
 # footer so it never fires on plain chat. XORICS-FEATURE: honesty-gate
-_DESIGN_TOOLS = {"delegate_to_coder", "check_circuit", "check_circuit_file", "compile_check"}
+_DESIGN_TOOLS = {"delegate_to_coder", "check_circuit", "check_circuit_file", "validate_circuit", "compile_check"}
 
 
 # Shared coder guidance (used by delegation and manual /code), tuned to avoid thrashing.
@@ -337,16 +377,21 @@ _CODER_GUIDE = (
     "- POWER DOMAINS are SEPARATE nets: USB VBUS (5V) and the 3V3 rail are different Nets — never the "
     "same one. A regulator converts between them, so its input and output are different nets: "
     "vbus=Net('VBUS'); v3=Net('3V3'); usb['VBUS']+=vbus; reg['VI']+=vbus; reg['VO']+=v3; esp['3V3']+=v3. "
-    "check_circuit now FAILS a board that merges 5V into 3V3 or shorts a regulator's VI to VO.\n"
-    "- Connect pins to Nets, END with ERC() then generate_netlist(), then call check_circuit. If it reports a "
-    "part not found, find_part and fix that ONE Part(...) call, then re-check. Keep fixing in SKiDL until it "
-    "builds — NEVER fall back to prose or a firmware sketch for a PCB task.\n"
-    "- If check_circuit FAILS, fix the CODE from the error message; do NOT re-search a part you already found "
-    "— you already have its library:name from find_part, so the bug is in the script, not the lookup.\n"
+    "validate_circuit now FAILS a board that merges 5V into 3V3 or shorts a regulator's VI to VO.\n"
+    "- Connect pins to Nets and END the script with ERC() then generate_netlist(). TO VALIDATE: write "
+    "the COMPLETE script in ONE fenced ```python block and, in that SAME message, call validate_circuit "
+    "— it saves the script and runs it. Do NOT paste the script into a tool argument; a large script "
+    "gets truncated there and never reaches the validator. If it reports a part not found, find_part and "
+    "fix that ONE Part(...) call, then send the corrected FULL script in a new ```python block and call "
+    "validate_circuit again. Keep fixing in SKiDL until it builds — NEVER fall back to prose or a "
+    "firmware sketch for a PCB task.\n"
+    "- If validate_circuit FAILS, fix the CODE from the error message; do NOT re-search a part you "
+    "already found — you already have its library:name from find_part, so the bug is in the script, not "
+    "the lookup.\n"
     "- NEVER reach BUILT by deleting connections: a part with nothing wired to it is not a board. If a "
     "pin name is rejected, get the real name from part_pins and RECONNECT — do not strip the design "
     "down to a lone unconnected part just to pass the check.\n"
-    "- When check_circuit returns BUILT, you are DONE: do NOT swap parts, refactor, or \"improve\" a "
+    "- When validate_circuit returns BUILT, you are DONE: do NOT swap parts, refactor, or \"improve\" a "
     "passing design — output the final code and stop. A built board you keep editing is how good ones break.\n"
     "Finish with the final code in a single fenced block, then one short line: what it does and the pins/specs used."
 )
@@ -535,23 +580,59 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
             if name in _DESIGN_TOOLS:            # honesty-gate: this turn attempted a design/build
                 design_attempt = True
             args = {}
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-                preview = {k: (v[:60] + "…" if isinstance(v, str) and len(v) > 60 else v)
-                           for k, v in args.items()}
-                print(f"  [{tag}→{name}]({preview})")
-                gate = notebook.gate(name, args) if notebook else None  # XORICS-FEATURE: dedup guard
-                if gate is not None:
-                    result = gate  # cached echo / hard refusal; impl NOT called
+            if name == "validate_circuit":
+                # Harness tool: the SKiDL script rides in THIS turn's fenced block, not the tool
+                # args (a large script truncates as a JSON arg, which is the flagship blocker).
+                # Pull it, save it, validate by path so the BUILT-by-path capture below still fires.
+                # XORICS-FEATURE: validate-from-fence
+                try:
+                    vargs = json.loads(tc.function.arguments or "{}")
+                except Exception:
+                    vargs = {}
+                result, saved = _validate_circuit_from_turn(msg.content or "", vargs.get("name") or "circuit")
+                if saved:
+                    args = {"path": saved}        # route the BUILT capture at the saved file
+                    try:
+                        with open(saved, "rb") as _f:
+                            _hh = hashlib.sha1(_f.read()).hexdigest()[:8]
+                    except Exception:
+                        _hh = "????????"
+                    print(f"  [{tag}→validate_circuit] saved → {saved}  (sha1 {_hh})")
                 else:
-                    result = TOOL_IMPLS[name](**args)
-                    if notebook:
-                        notebook.record(name, args, result)  # success only; errors raise before here
+                    print(f"  [{tag}→validate_circuit] no fenced python in this turn — corrective sent")
                 rp = " ".join(str(result).split())
                 print(f"    ↳ {rp[:160]}{'…' if len(rp) > 160 else ''}")
-            except Exception as e:
-                result = f"[tool error in {name}: {e}] — adjust and try another approach."
-                print(f"  [{tag}→{name}] ERROR: {e}")
+            else:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                    preview = {k: (v[:60] + "…" if isinstance(v, str) and len(v) > 60 else v)
+                               for k, v in args.items()}
+                    print(f"  [{tag}→{name}]({preview})")
+                    gate = notebook.gate(name, args) if notebook else None  # XORICS-FEATURE: dedup guard
+                    if gate is not None:
+                        result = gate  # cached echo / hard refusal; impl NOT called
+                    else:
+                        result = TOOL_IMPLS[name](**args)
+                        if notebook:
+                            notebook.record(name, args, result)  # success only; errors raise before here
+                    rp = " ".join(str(result).split())
+                    print(f"    ↳ {rp[:160]}{'…' if len(rp) > 160 else ''}")
+                except json.JSONDecodeError as e:
+                    if name == "check_circuit":
+                        # The exact flagship failure: the script was too big to pass as a JSON arg and
+                        # got cut off. Redirect to validate_circuit instead of letting the coder retry
+                        # the same oversized inline call into the backstop. XORICS-FEATURE: validate-from-fence
+                        result = ("[use validate_circuit instead: the script was too large to pass as a "
+                                  f"tool argument and was truncated ({e}). Do NOT retry check_circuit with "
+                                  "inline code. Write the COMPLETE SKiDL script in ONE fenced ```python "
+                                  "block and, in the same message, call validate_circuit — that path saves "
+                                  "the script to disk and has no size limit.]")
+                    else:
+                        result = f"[tool error in {name}: bad arguments ({e})] — adjust and try another approach."
+                    print(f"  [{tag}→{name}] ARG-PARSE ERROR: {e}")
+                except Exception as e:
+                    result = f"[tool error in {name}: {e}] — adjust and try another approach."
+                    print(f"  [{tag}→{name}] ERROR: {e}")
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)})
             # Structured success: check_circuit told us it BUILT (via .status, not text-matching).
             # Capture the exact script that passed so a later edit can't overwrite the win.
