@@ -1,0 +1,21 @@
+# llama-swap.yaml - REBUILT 2026-06-23 (original was gitignored + deleted, not in history).
+# Keys must match xorics.py MANAGER/CODER. Models hot-swap: one in VRAM at a time.
+healthCheckTimeout: 600
+logLevel: info
+
+models:
+  "gpt-oss":
+    cmd: |
+      /home/zawayix/llama.cpp/build/bin/llama-server
+      --model /home/zawayix/llama.cpp/gpt-oss-20b.gguf
+      --host 127.0.0.1 --port ${PORT}
+      -ngl 99 --ctx-size 16384 --jinja
+    ttl: 600
+
+  "qwen3-coder":
+    cmd: |
+      /home/zawayix/llama.cpp/build/bin/llama-server
+      --model /home/zawayix/.cache/huggingface/hub/models--unsloth--Qwen3-Coder-30B-A3B-Instruct-GGUF/snapshots/b17cb02dd882d5b6ab62fc777ad2995f19668350/Qwen3-Coder-30B-A3B-Instruct-Q3_K_S.gguf
+      --host 127.0.0.1 --port ${PORT}
+      -ngl 99 --ctx-size 8192 --jinja
+    ttl: 600
