@@ -158,6 +158,8 @@ CODER = "qwen3-coder"
 # unattended run can't loop forever. Tune CHECKPOINT_EVERY to taste.
 CHECKPOINT_EVERY = 5
 CODER_BACKSTOP = 40
+RESEARCH_NUDGE_AT = 12      # research-tool calls without a validated circuit before we force a WRITE
+RESEARCH_NUDGE_EVERY = 6    # if it keeps stalling, re-nudge every N further look-ups (escalation)
 
 # Brain endpoint = llama-swap. Ask for a model by name; it loads/evicts on the GPU.
 client = OpenAI(base_url="http://127.0.0.1:9090/v1", api_key="not-needed")
@@ -382,12 +384,37 @@ CODER_TOOLS = [t for t in TOOLS if t["function"]["name"]
 # footer so it never fires on plain chat. XORICS-FEATURE: honesty-gate
 _DESIGN_TOOLS = {"delegate_to_coder", "check_circuit", "check_circuit_file", "validate_circuit", "compile_check"}
 
+# Convergence guard: the coder tends to research a hard board forever (and overflow its 8K context)
+# instead of committing to a SKiDL script. We count look-ups since the last validated circuit and,
+# past a threshold, force it to WRITE — which also keeps token use under the window. XORICS-FEATURE: convergence-guard
+_RESEARCH_TOOLS = {"web_search", "search_datasheets", "fetch_datasheet",
+                   "find_part", "find_footprint", "part_pins", "read_file"}
+_CONVERGENCE_NUDGE = (
+    "\n\n⛔ CONVERGENCE — you have run {n} look-ups without validating a circuit. You already have the "
+    "parts you need; find_part returns VERIFIED parts, so STOP searching. In your NEXT message write the "
+    "COMPLETE SKiDL script — from `from skidl import *` through `ERC()` and `generate_netlist()` — in ONE "
+    "fenced ```python block and call validate_circuit. Do NOT call web_search / find_part / find_footprint "
+    "/ search_datasheets again until you have a validated circuit. A board that builds with the parts you "
+    "have beats more research, and writing now keeps you inside the context window.")
+
+
+def _should_nudge(research_streak, nudged_at):
+    """Convergence-guard firing rule, kept standalone so the schedule is hermetically testable: nudge
+    once look-ups since the last validated circuit reach RESEARCH_NUDGE_AT, then re-nudge every
+    RESEARCH_NUDGE_EVERY further look-ups if the coder keeps stalling. After a validated circuit the
+    caller resets both counters to 0, which re-arms the first clause. XORICS-FEATURE: convergence-guard
+    """
+    return (research_streak >= RESEARCH_NUDGE_AT
+            and (nudged_at == 0 or research_streak - nudged_at >= RESEARCH_NUDGE_EVERY))
+
 
 # Shared coder guidance (used by delegation and manual /code), tuned to avoid thrashing.
 _CODER_GUIDE = (
-    "Look up real pins/specs with search_datasheets (fetch_datasheet if missing); web_search for errors or "
-    "APIs you're unsure of. Don't over-research — after a couple of lookups, WRITE the design and let the "
-    "validator give you feedback; iterate from real errors, not endless searching.\n"
+    "Look up real pins/specs with find_part / find_footprint (search_datasheets for a specific spec, web_search "
+    "only for errors or APIs you're unsure of). DON'T over-research: find_part already returns a VERIFIED part "
+    "with its real pin names, so a few find_part / find_footprint calls is all most boards need — then WRITE the "
+    "COMPLETE design and let the validator give you feedback. Iterating on a real script beats endless searching, "
+    "and after too many look-ups without a validated circuit you'll be told to stop and write.\n"
     "FIRMWARE: write an Arduino sketch, call compile_check, fix until it builds. Final code in one ```cpp block.\n"
     "PCB / circuit: design in SKiDL (Python). Essentials:\n"
     "  from skidl import *\n"
@@ -580,6 +607,8 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
     built_happened = False                       # any validator returned BUILT this loop  (honesty-gate)
     design_attempt = False                       # any design/validation tool fired (footer scope)
     validated_sha1s = set()                      # sha1 of every script validate_circuit ran — anti-restage guard
+    research_streak = 0                          # look-ups since the last validated circuit  (convergence guard)
+    nudged_at = 0                                # research_streak value at the last convergence nudge
     # XORICS-FEATURE: coder-notebook -- externalized resolved-parts memory + dedup guard
     notebook = Notebook(task=messages[1]["content"]) if tag == "coder" and len(messages) > 1 else None
     base_system = messages[0]["content"]
@@ -616,6 +645,10 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
             name = tc.function.name
             if name in _DESIGN_TOOLS:            # honesty-gate: this turn attempted a design/build
                 design_attempt = True
+            if name in _RESEARCH_TOOLS:          # convergence guard: count look-ups since last validate
+                research_streak += 1
+            elif name in ("check_circuit", "check_circuit_file", "compile_check"):  # committed to a build → reset
+                research_streak = nudged_at = 0
             args = {}
             if name == "validate_circuit":
                 # Harness tool: the SKiDL script rides in the coder's message CONTENT (a fenced
@@ -634,6 +667,7 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
                     result, saved = (f"[validate_circuit error: {e}] — fix the script and try again.", None)
                 if saved:
                     args = {"path": saved}        # route the BUILT capture at the saved file
+                    research_streak = nudged_at = 0   # a script reached the grader — convergence reset
                     try:
                         with open(saved, "rb") as _f:
                             _hh = hashlib.sha1(_f.read()).hexdigest()[:8]
@@ -694,6 +728,18 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
                         built_code = ""   # unreadable, but it built — still stop (below)
             elif getattr(result, "status", None) == "user_stopped":  # XORICS-FEATURE: coder-control
                 stopped_msg = str(result)        # human halted a delegated coder; do not re-delegate
+        # Convergence guard: too many look-ups without a validated circuit → force a WRITE. We append the
+        # push to the last tool result of this turn (always template-valid, unlike injecting a user turn
+        # mid tool-sequence) so the coder sees it next turn; escalates if it keeps stalling, and resets the
+        # moment a script is validated. This is the mechanical teeth behind the guide's "don't over-research"
+        # rule, and it keeps the conversation from growing past the 8K window. XORICS-FEATURE: convergence-guard
+        if _should_nudge(research_streak, nudged_at):
+            for _m in reversed(messages):
+                if _m.get("role") == "tool":
+                    _m["content"] = (_m.get("content") or "") + _CONVERGENCE_NUDGE.format(n=research_streak)
+                    break
+            nudged_at = research_streak
+            print(f"  [{tag}] convergence nudge — {research_streak} look-ups, no validated circuit; pushing to WRITE")
         if stopped_msg is not None:
             print("    ■ coder stopped at your request — not re-delegating.")
             final_text = stopped_msg
