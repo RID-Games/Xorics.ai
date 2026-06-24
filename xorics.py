@@ -389,13 +389,18 @@ _DESIGN_TOOLS = {"delegate_to_coder", "check_circuit", "check_circuit_file", "va
 # past a threshold, force it to WRITE — which also keeps token use under the window. XORICS-FEATURE: convergence-guard
 _RESEARCH_TOOLS = {"web_search", "search_datasheets", "fetch_datasheet",
                    "find_part", "find_footprint", "part_pins", "read_file"}
+# Once the guard fires we drop the SOFT look-ups (open-ended web search — the spiral + overflow
+# source) so the coder physically can't keep researching. find_part / find_footprint / part_pins
+# stay, since those return VERIFIED parts it needs to actually write. XORICS-FEATURE: convergence-guard
+_SOFT_RESEARCH_TOOLS = {"web_search", "search_datasheets", "fetch_datasheet"}
 _CONVERGENCE_NUDGE = (
     "\n\n⛔ CONVERGENCE — you have run {n} look-ups without validating a circuit. You already have the "
-    "parts you need; find_part returns VERIFIED parts, so STOP searching. In your NEXT message write the "
-    "COMPLETE SKiDL script — from `from skidl import *` through `ERC()` and `generate_netlist()` — in ONE "
-    "fenced ```python block and call validate_circuit. Do NOT call web_search / find_part / find_footprint "
-    "/ search_datasheets again until you have a validated circuit. A board that builds with the parts you "
-    "have beats more research, and writing now keeps you inside the context window.")
+    "parts you need; find_part returns VERIFIED parts, so STOP searching. In your NEXT message write a "
+    "FIRST version of the SKiDL board — the core parts wired up, ending in `ERC()` and "
+    "`generate_netlist()`, even if minimal and imperfect — in ONE fenced ```python block, and call "
+    "validate_circuit. It does NOT have to be complete or correct yet: get a draft onto disk, and the "
+    "validator's errors will tell you exactly what to fix. A minimal board you can iterate on beats "
+    "more research.")
 
 
 def _should_nudge(research_streak, nudged_at):
@@ -406,6 +411,32 @@ def _should_nudge(research_streak, nudged_at):
     """
     return (research_streak >= RESEARCH_NUDGE_AT
             and (nudged_at == 0 or research_streak - nudged_at >= RESEARCH_NUDGE_EVERY))
+
+
+def _task_wants_circuit(messages):
+    """True if the delegated task calls for a circuit / PCB / schematic / BOM deliverable, so a mere
+    firmware compile must NOT be allowed to satisfy it. Conservative whole-word keyword match on the
+    task text (messages[1]). 'board' is deliberately NOT a keyword — it's too ambiguous ('dev board',
+    'onboard', 'breadboard') and would wrongly reject firmware tasks; real PCB tasks always carry a
+    strong signal (schematic/pcb/kicad/...). A pure firmware task ('blink the onboard LED on the dev
+    board') matches nothing here and firmware still finalizes it. XORICS-FEATURE: pcb-firmware-distinct
+    """
+    task = (messages[1].get("content") or "").lower() if len(messages) > 1 else ""
+    return bool(re.search(r"\b(schematic|bom|pcb|circuit|netlist|kicad|skidl|footprint)\b", task))
+
+
+# Pushed back at the coder when a firmware compile tries to stand in for a board (closes the off-ramp
+# that produced a false VERIFIED), and when a circuit FAILS (self-prompt the localized fix instead of
+# bailing). Iterate-don't-one-shot, made mechanical. XORICS-FEATURE: pcb-firmware-distinct
+_FIRMWARE_NOT_A_BOARD = (
+    "\n\n⛔ A firmware sketch compiling does NOT complete this board task — you still owe a CIRCUIT. "
+    "Write the SKiDL schematic (from `from skidl import *` through `ERC()` and `generate_netlist()`) in "
+    "ONE fenced ```python block and call validate_circuit. Do not submit firmware again for this task.")
+_FAILED_FIX_DIRECTIVE = (
+    "\n\n→ Fix exactly these errors in the SKiDL and re-validate — a rejected pin name comes from "
+    "part_pins (use the EXACT name), a bad connection from the net wiring. Send the corrected FULL "
+    "script in ONE ```python block and call validate_circuit again. Stay in SKiDL; don't switch to "
+    "firmware or re-research parts you already have.")
 
 
 # Shared coder guidance (used by delegation and manual /code), tuned to avoid thrashing.
@@ -422,6 +453,11 @@ _CODER_GUIDE = (
     "  vcc, gnd = Net('3V3'), Net('GND');  vcc += r[1];  gnd += r[2]\n"
     "  ERC(); generate_netlist()\n"
     "Anti-thrash rules:\n"
+    "- ITERATE, don't one-shot: get a FIRST minimal board (the core parts wired, ending in ERC() and "
+    "generate_netlist()) validated EARLY, then fix from the validator's concrete errors — exactly how "
+    "you'd iterate a firmware sketch. A board/schematic/BOM task is DONE only when validate_circuit (a "
+    "CIRCUIT) returns BUILT; a firmware compile never satisfies it, so don't reach for a sketch when the "
+    "SKiDL gets hard — write a rougher board and let the errors guide you.\n"
     "- The ESP32-C3 Super Mini is built on an ESP32-C3 (the ESP32-C3-MINI-1 module, or a bare ESP32-C3FH4). "
     "Pick whichever find_part returns and move on — do NOT keep hunting chip variants.\n"
     "- For non-trivial parts (regulator, module, connector, IC) call find_part ONCE and use the first "
@@ -609,6 +645,7 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
     validated_sha1s = set()                      # sha1 of every script validate_circuit ran — anti-restage guard
     research_streak = 0                          # look-ups since the last validated circuit  (convergence guard)
     nudged_at = 0                                # research_streak value at the last convergence nudge
+    wants_circuit = _task_wants_circuit(messages)  # firmware must not satisfy a PCB task  (pcb-firmware-distinct)
     # XORICS-FEATURE: coder-notebook -- externalized resolved-parts memory + dedup guard
     notebook = Notebook(task=messages[1]["content"]) if tag == "coder" and len(messages) > 1 else None
     base_system = messages[0]["content"]
@@ -629,7 +666,13 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
         messages = _trim_history(messages)
         if notebook:  # XORICS-FEATURE: pin notebook into the always-kept head
             messages[0] = {**messages[0], "content": base_system + notebook.render()}
-        resp = client.chat.completions.create(model=model, messages=messages, tools=tools)
+        active = tools
+        if tag == "coder" and research_streak >= RESEARCH_NUDGE_AT:
+            # convergence guard with teeth: once it fires, drop the soft web look-ups so the coder
+            # cannot keep researching — it must write or stop. Restores automatically when a validated
+            # circuit resets research_streak to 0. XORICS-FEATURE: convergence-guard
+            active = [t for t in tools if t["function"]["name"] not in _SOFT_RESEARCH_TOOLS]
+        resp = client.chat.completions.create(model=model, messages=messages, tools=active)
         msg = resp.choices[0].message
         if not msg.tool_calls:
             final_text = msg.content or ""
@@ -645,10 +688,10 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
             name = tc.function.name
             if name in _DESIGN_TOOLS:            # honesty-gate: this turn attempted a design/build
                 design_attempt = True
-            if name in _RESEARCH_TOOLS:          # convergence guard: count look-ups since last validate
+            if tag == "coder" and name in _RESEARCH_TOOLS:   # convergence guard (coder only): count look-ups
                 research_streak += 1
-            elif name in ("check_circuit", "check_circuit_file", "compile_check"):  # committed to a build → reset
-                research_streak = nudged_at = 0
+            elif name in ("check_circuit", "check_circuit_file") or (name == "compile_check" and not wants_circuit):
+                research_streak = nudged_at = 0   # committed to a real build — but firmware doesn't count on a PCB task
             args = {}
             if name == "validate_circuit":
                 # Harness tool: the SKiDL script rides in the coder's message CONTENT (a fenced
@@ -713,21 +756,32 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
             # Structured success: check_circuit told us it BUILT (via .status, not text-matching).
             # Capture the exact script that passed so a later edit can't overwrite the win.
             if getattr(result, "status", None) == "built":
-                built_happened = True            # honesty-gate: a real BUILT verdict landed
-                built_code = args.get("code")
-                if built_code is None and args.get("path"):
-                    # check_circuit_file validates a SAVED script by PATH, so there's no inline
-                    # `code` to capture. Read the verified file back so BUILT-stop still fires —
-                    # without this a file-based BUILT never stopped the loop, and the coder
-                    # wandered off rebuilding a board that had already passed (and broke it).
-                    try:
-                        from pathlib import Path as _P
-                        built_path = str(_P(args["path"]).expanduser())   # report this; don't re-slug
-                        built_code = _P(built_path).read_text()
-                    except Exception:
-                        built_code = ""   # unreadable, but it built — still stop (below)
+                if wants_circuit and name == "compile_check":
+                    # PCB task, but only FIRMWARE compiled — a sketch is not the board. Reject it as the
+                    # deliverable (don't finalize/stop) and push the coder back into SKiDL, so a firmware
+                    # compile can't fake a VERIFIED board. XORICS-FEATURE: pcb-firmware-distinct
+                    messages[-1]["content"] = str(messages[-1].get("content") or "") + _FIRMWARE_NOT_A_BOARD
+                    print(f"  [{tag}] firmware BUILT does NOT satisfy a board task — pushing back to SKiDL")
+                else:
+                    built_happened = True            # honesty-gate: a real BUILT verdict landed
+                    built_code = args.get("code")
+                    if built_code is None and args.get("path"):
+                        # check_circuit_file validates a SAVED script by PATH, so there's no inline
+                        # `code` to capture. Read the verified file back so BUILT-stop still fires —
+                        # without this a file-based BUILT never stopped the loop, and the coder
+                        # wandered off rebuilding a board that had already passed (and broke it).
+                        try:
+                            from pathlib import Path as _P
+                            built_path = str(_P(args["path"]).expanduser())   # report this; don't re-slug
+                            built_code = _P(built_path).read_text()
+                        except Exception:
+                            built_code = ""   # unreadable, but it built — still stop (below)
             elif getattr(result, "status", None) == "user_stopped":  # XORICS-FEATURE: coder-control
                 stopped_msg = str(result)        # human halted a delegated coder; do not re-delegate
+            elif getattr(result, "status", None) == "failed" and name == "validate_circuit":
+                # self-prompt the fix: the concrete errors are already in this tool result; tell the coder
+                # to fix THOSE and re-validate, staying in SKiDL. XORICS-FEATURE: pcb-firmware-distinct
+                messages[-1]["content"] = str(messages[-1].get("content") or "") + _FAILED_FIX_DIRECTIVE
         # Convergence guard: too many look-ups without a validated circuit → force a WRITE. We append the
         # push to the last tool result of this turn (always template-valid, unlike injecting a user turn
         # mid tool-sequence) so the coder sees it next turn; escalates if it keeps stalling, and resets the
