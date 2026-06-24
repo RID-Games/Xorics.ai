@@ -1,8 +1,10 @@
 """validate_circuit — the fence-handoff that gets a large SKiDL board onto disk and into the
-grader WITHOUT the coder JSON-escaping it into a tool argument (the flagship serialization
-blocker). Hermetic: stubs xorics's heavy siblings, and spies save_circuit / check_circuit_file
-so we can assert exactly what the helper hands them. The real ERC build is the LIVE probe's job
-(green mocks lie); this suite proves the WIRING. Runs anywhere:
+validator WITHOUT the coder JSON-escaping it into a tool argument (the flagship serialization
+blocker). The coder does not reliably co-emit the script with the tool call, so validate_circuit
+sources the script from the coder's most recent SKiDL fence (this turn first, else a recent
+earlier turn) and dedups by sha1 so identical bytes are never re-validated. Hermetic: stubs
+xorics's heavy siblings, spies save_circuit / check_circuit_file. The real ERC build is the LIVE
+probe's job (green mocks lie); this suite proves the WIRING. Runs anywhere:
     python test_validate_circuit.py        (or: pytest test_validate_circuit.py)
 """
 import os
@@ -58,8 +60,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import xorics  # noqa: E402
 
 
-# A flagship-class script: well over the ~1 KB JSON-arg wall, full of the exact characters that
-# break tool-arg JSON escaping — embedded double/single quotes, backslashes, and many newlines.
+# A flagship-class script: over the ~1 KB JSON-arg wall, with the exact characters that break
+# tool-arg JSON escaping — embedded double/single quotes, backslashes, many newlines — and the
+# SKiDL signals (`from skidl`, `generate_netlist`) the fence-scanner keys on.
 SCRIPT = (
     "from skidl import *\n"
     "# windows-y path C:\\\\kicad and quoted pins \"VI\"/'VO' are what wreck JSON escaping\n"
@@ -70,47 +73,122 @@ SCRIPT = (
     + "\nERC()\ngenerate_netlist()\n"
 )
 assert len(SCRIPT) > 1500, "fixture must exceed the ~1KB wall to be a meaningful test"
+EXPECTED = SCRIPT.strip()          # extract path strips the fenced block (ends only, never indentation)
 TURN_WITH_FENCE = "Here's the ambient-light sensor board.\n\n```python\n" + SCRIPT + "```\n"
-# extract_code strips the fenced block (harmless for SKiDL — only the ends, never indentation),
-# so the bytes that reach save_circuit are the script with leading/trailing whitespace removed.
-EXPECTED = SCRIPT.strip()
+
+SYS = {"role": "system", "content": "you are the coder"}
+USER = {"role": "user", "content": "Design a discreet flashlight-style ambient-light sensor board."}
+def asst(content): return {"role": "assistant", "content": content}
+def tool(content): return {"role": "tool", "content": content}
 
 
-def test_pulls_fence_saves_exact_code_and_validates_by_that_path():
+def test_coemit_current_turn_validates_that_script():
     _reset()
-    result, saved = xorics._validate_circuit_from_turn(TURN_WITH_FENCE, "g2_ambient_sensor")
+    seen = set()
+    msgs = [SYS, USER, asst(TURN_WITH_FENCE)]            # script co-emitted with the validate call
+    result, saved = xorics._validate_circuit_from_turn(msgs, "g2_ambient_sensor", seen)
     assert _spy["saved_code"] == EXPECTED, "saved code must be the fenced script verbatim (no truncation)"
-    assert _spy["saved_name"] == "g2_ambient_sensor", "the name arg must become the saved slug"
+    assert _spy["saved_name"] == "g2_ambient_sensor"
     assert saved and _spy["checked_path"] == saved, "validator must run on the path we just saved"
-    assert getattr(result, "status", None) == "built", "built status must pass through"
+    assert getattr(result, "status", None) == "built"
 
 
-def test_no_fence_returns_corrective_and_writes_nothing():
+def test_falls_back_to_recent_prior_fence_when_current_turn_is_empty():
+    # the coder's actual rhythm: write the script one turn, then call validate_circuit on the next
+    # turn with EMPTY content. The script must still be found (in the recent earlier assistant turn).
     _reset()
-    result, saved = xorics._validate_circuit_from_turn(
-        "I'll use an ESP32-C3 and an AP2112K. No script yet.", "g2_ambient_sensor")
-    assert saved is None, "no fence -> nothing saved"
-    assert _spy["saved_code"] is None, "save_circuit must NOT be called without a fence"
-    assert "validate_circuit" in result and "```python" in result, "must tell the coder to emit a fence"
+    seen = set()
+    msgs = [SYS, USER, asst(TURN_WITH_FENCE), tool("Pins for ATtiny..."), asst("")]
+    result, saved = xorics._validate_circuit_from_turn(msgs, "x", seen)
+    assert _spy["saved_code"] == EXPECTED, "must reach back to the coder's most recent script"
+    assert saved and getattr(result, "status", None) == "built"
+
+
+def test_dedup_refuses_an_identical_script_the_second_time():
+    _reset()
+    seen = set()
+    msgs = [SYS, USER, asst(TURN_WITH_FENCE)]
+    _, s1 = xorics._validate_circuit_from_turn(msgs, "x", seen)
+    assert s1 and _spy["saved_code"] == EXPECTED, "first time: the script is validated"
+    _reset()                                            # clear the spy to detect a second save
+    r2, s2 = xorics._validate_circuit_from_turn(msgs, "x", seen)
+    assert s2 is None, "identical bytes must not be re-validated"
+    assert _spy["saved_code"] is None, "save_circuit must NOT run on a repeat"
+    assert "SAME script" in r2 or "already validated" in r2, "corrective must say it's a repeat"
+
+
+def test_a_changed_script_after_a_repeat_is_validated():
+    # dedup must block ONLY identical bytes — a real edit has to get through.
+    _reset()
+    seen = set()
+    xorics._validate_circuit_from_turn([SYS, USER, asst(TURN_WITH_FENCE)], "x", seen)   # seed sha1(A)
+    _reset()
+    changed = TURN_WITH_FENCE.replace("AP2112K-3.3", "AMS1117-3.3")                     # different bytes
+    _, saved = xorics._validate_circuit_from_turn([SYS, USER, asst(changed)], "x", seen)
+    assert saved and _spy["saved_code"] is not None, "a changed script must validate, not dedup"
+    assert "AMS1117-3.3" in _spy["saved_code"]
+
+
+def test_no_skidl_script_anywhere_returns_corrective_and_writes_nothing():
+    _reset()
+    seen = set()
+    msgs = [SYS, USER, asst("I'll use an ESP32-C3 and an AP2112K. No script yet.")]
+    result, saved = xorics._validate_circuit_from_turn(msgs, "x", seen)
+    assert saved is None and _spy["saved_code"] is None, "nothing to validate -> save nothing"
+    assert "SKiDL script" in result
+
+
+def test_a_non_skidl_block_is_not_mistaken_for_the_board():
+    _reset()
+    seen = set()
+    msgs = [SYS, USER, asst("first:\n```bash\nls circuits/\n```\nthat's all for now")]
+    result, saved = xorics._validate_circuit_from_turn(msgs, "x", seen)
+    assert saved is None and _spy["saved_code"] is None, "a bash block is not a SKiDL board"
+
+
+def test_skidl_block_is_found_even_beside_a_longer_noise_block():
+    # a message can hold a longer non-SKiDL block (e.g. a pasted log) next to the real script;
+    # the script must still be picked, not skipped because it isn't the longest block.
+    _reset()
+    seen = set()
+    noise = "```\n" + ("LOG LINE bla bla\n" * 400) + "```\n"        # longer than the script, not SKiDL
+    msgs = [SYS, USER, asst(noise + "and the board:\n```python\n" + SCRIPT + "```\n")]
+    xorics._validate_circuit_from_turn(msgs, "x", seen)
+    assert _spy["saved_code"] == EXPECTED, "the SKiDL block must win over a longer non-SKiDL block"
+
+
+def test_most_recent_skidl_fence_wins_over_an_older_one():
+    _reset()
+    seen = set()
+    newer_script = SCRIPT.replace("range(60)", "range(40)")          # a different, newer script
+    newer = "revised board:\n```python\n" + newer_script + "```\n"
+    msgs = [SYS, USER, asst(TURN_WITH_FENCE), tool("..."), asst(newer)]
+    xorics._validate_circuit_from_turn(msgs, "x", seen)
+    assert _spy["saved_code"] == newer_script.strip(), "must validate the NEWEST script"
+
+
+def test_a_fence_in_tool_output_is_never_pulled():
+    # only the coder's own (assistant) messages count — a script echoed in a TOOL result is not
+    # the coder's design and must not be validated.
+    _reset()
+    seen = set()
+    msgs = [SYS, USER, tool("here is a script:\n```python\n" + SCRIPT + "```\n"), asst("validating now")]
+    result, saved = xorics._validate_circuit_from_turn(msgs, "x", seen)
+    assert saved is None and _spy["saved_code"] is None, "a fence in tool output is not the coder's board"
 
 
 def test_failed_verdict_passes_through_so_the_coder_can_iterate():
     _reset()
+    seen = set()
     _verdict["status"] = "failed"
-    result, saved = xorics._validate_circuit_from_turn(TURN_WITH_FENCE, "x")
+    result, saved = xorics._validate_circuit_from_turn([SYS, USER, asst(TURN_WITH_FENCE)], "x", seen)
     assert saved and getattr(result, "status", None) == "failed", "a failed build must not look built"
-
-
-def test_longest_block_wins_so_a_small_noise_block_is_not_validated():
-    _reset()
-    turn = "first, a quick check:\n```bash\nls circuits/\n```\n\nnow the board:\n```python\n" + SCRIPT + "```\n"
-    xorics._validate_circuit_from_turn(turn, "x")
-    assert _spy["saved_code"] == EXPECTED, "must validate the python board, not the tiny bash block"
 
 
 def test_empty_name_falls_back_to_a_default_slug():
     _reset()
-    xorics._validate_circuit_from_turn(TURN_WITH_FENCE, "")
+    seen = set()
+    xorics._validate_circuit_from_turn([SYS, USER, asst(TURN_WITH_FENCE)], "", seen)
     assert _spy["saved_name"] == "circuit", "an empty name must not crash; it defaults to 'circuit'"
 
 

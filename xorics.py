@@ -88,27 +88,63 @@ def extract_code(text: str) -> str | None:
     return max(blocks, key=len) if blocks else None
 
 
-def _validate_circuit_from_turn(content: str, name: str):
+def _latest_coder_fence(messages):
+    """The most recent COMPLETE SKiDL script the coder emitted in one of its OWN (assistant)
+    messages, scanning newest-first. The current turn is already appended to `messages` before
+    tool dispatch, so this naturally prefers a script co-emitted with the validate_circuit call
+    and otherwise falls back to one the coder wrote a turn or two earlier (its common rhythm:
+    write the script, then call validate_circuit on the NEXT turn with empty content). Only
+    ASSISTANT messages count, so tool output / search results can't be mistaken for the design.
+    Within a message we scan EVERY fenced block and keep only ones that look like SKiDL ('skidl'
+    or 'generate_netlist'), so a stray ```bash / firmware ```cpp block — even a longer one sitting
+    next to the script — can't be picked. Returns the longest qualifying script, or None.
+    """
+    for m in reversed(messages):
+        if m.get("role") != "assistant":
+            continue
+        blocks = re.findall(r"```[a-zA-Z0-9_+\-]*\s*\n?(.*?)```", m.get("content") or "", re.DOTALL)
+        skidl = [b.strip() for b in blocks
+                 if b.strip() and ("generate_netlist" in b or "skidl" in b.lower())]
+        if skidl:
+            return max(skidl, key=len)
+    return None
+
+
+def _validate_circuit_from_turn(messages, name, seen_sha1s):
     """Body of the validate_circuit tool, kept standalone so it stays hermetically testable.
 
     Why this exists: the coder can emit a multi-KB SKiDL script as a fenced ```python block in
     its message CONTENT, but cannot reliably JSON-escape that same script into a tool-call
-    argument — past ~1 KB the arguments JSON breaks ('missing closing quote') and check_circuit
-    never even runs. So validate_circuit does NOT take the script inline: it pulls the script
-    from THIS turn's fenced block, saves it to circuits/<name>/<name>.py, and validates by PATH
-    via check_circuit_file (which reuses the agent loop's BUILT-by-path capture).
+    argument — past ~1 KB the arguments JSON breaks ('missing closing quote') and the validator
+    never even runs. So validate_circuit does NOT take the script inline: it takes the coder's
+    most recent SKiDL fence (via _latest_coder_fence — current turn first, else a recent earlier
+    turn, because the coder does not reliably co-emit the script with the tool call), saves it to
+    circuits/<name>/<name>.py, and validates by PATH via check_circuit_file (which reuses the
+    agent loop's BUILT-by-path capture).
+
+    Reaching back to an earlier turn risks re-validating a stale draft, so `seen_sha1s` guards it:
+    the exact bytes of every validated script are remembered, and an identical script is REFUSED
+    rather than re-run (same script -> same verdict = a wasted turn that can masquerade as
+    progress). The coder must CHANGE the code to advance. `seen_sha1s` is mutated in place.
 
     Returns (result, saved_path). `result` is whatever check_circuit_file returns (the
-    status-carrying CheckResult); `saved_path` is the file it wrote. When the turn carries no
-    fenced block it returns (corrective_message, None) and writes nothing — it never silently
-    reaches back to an OLDER fence, which could validate a stale draft. XORICS-FEATURE: validate-from-fence
+    status-carrying CheckResult), or a corrective string; `saved_path` is the file it wrote, or
+    None when nothing was validated. XORICS-FEATURE: validate-from-fence
     """
-    code = extract_code(content or "")
+    code = _latest_coder_fence(messages)
     if not code:
-        return (("[validate_circuit: no fenced ```python block in this message. Put the COMPLETE "
-                 "SKiDL script in ONE ```python block in the SAME message as the validate_circuit "
-                 "call, then call it again. Do NOT paste the script into the tool arguments — that "
-                 "is exactly what truncates on a large board.]"), None)
+        return (("[validate_circuit: I can't find a complete SKiDL script. Put the FULL script — "
+                 "from `from skidl import *` through `ERC()` and `generate_netlist()` — in ONE "
+                 "fenced ```python block (this message or your previous one), then call "
+                 "validate_circuit. Do NOT paste the script into the tool arguments; that truncates "
+                 "on a large board.]"), None)
+    h = hashlib.sha1(code.encode()).hexdigest()
+    if h in seen_sha1s:
+        return (("[validate_circuit: this is the SAME script you already validated — re-running "
+                 "identical code gives the identical result. Change the SKiDL to fix the error from "
+                 "the last verdict (e.g. a pin name or a connection), then call validate_circuit "
+                 "again.]"), None)
+    seen_sha1s.add(h)
     saved = save_circuit(code, name=name or "circuit")
     return (check_circuit_file(saved), saved)
 
@@ -543,6 +579,7 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
     built_path = None                            # set iff BUILT came from a file path
     built_happened = False                       # any validator returned BUILT this loop  (honesty-gate)
     design_attempt = False                       # any design/validation tool fired (footer scope)
+    validated_sha1s = set()                      # sha1 of every script validate_circuit ran — anti-restage guard
     # XORICS-FEATURE: coder-notebook -- externalized resolved-parts memory + dedup guard
     notebook = Notebook(task=messages[1]["content"]) if tag == "coder" and len(messages) > 1 else None
     base_system = messages[0]["content"]
@@ -581,15 +618,20 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
                 design_attempt = True
             args = {}
             if name == "validate_circuit":
-                # Harness tool: the SKiDL script rides in THIS turn's fenced block, not the tool
-                # args (a large script truncates as a JSON arg, which is the flagship blocker).
-                # Pull it, save it, validate by path so the BUILT-by-path capture below still fires.
-                # XORICS-FEATURE: validate-from-fence
+                # Harness tool: the SKiDL script rides in the coder's message CONTENT (a fenced
+                # ```python block), not the tool args — a large script truncates as a JSON arg,
+                # which is the flagship blocker. Take the coder's most recent SKiDL fence (this
+                # turn first, else a recent earlier turn), save it, and validate by PATH so the
+                # BUILT-by-path capture below still fires. XORICS-FEATURE: validate-from-fence
                 try:
                     vargs = json.loads(tc.function.arguments or "{}")
                 except Exception:
                     vargs = {}
-                result, saved = _validate_circuit_from_turn(msg.content or "", vargs.get("name") or "circuit")
+                try:
+                    result, saved = _validate_circuit_from_turn(messages, vargs.get("name") or "circuit",
+                                                                validated_sha1s)
+                except Exception as e:
+                    result, saved = (f"[validate_circuit error: {e}] — fix the script and try again.", None)
                 if saved:
                     args = {"path": saved}        # route the BUILT capture at the saved file
                     try:
@@ -599,7 +641,7 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
                         _hh = "????????"
                     print(f"  [{tag}→validate_circuit] saved → {saved}  (sha1 {_hh})")
                 else:
-                    print(f"  [{tag}→validate_circuit] no fenced python in this turn — corrective sent")
+                    print(f"  [{tag}→validate_circuit] no new SKiDL script to validate — corrective sent")
                 rp = " ".join(str(result).split())
                 print(f"    ↳ {rp[:160]}{'…' if len(rp) > 160 else ''}")
             else:
