@@ -584,7 +584,15 @@ def active_tools():
 
 
 # ---- The agent loop -----------------------------------------------------------
-def ask(user_message: str) -> str:
+def ask(user_message: str, history=None) -> str:
+    """One turn of conversation.
+
+    history: prior turns as [{"role": "user"|"assistant", "content": str}, ...],
+    oldest first — exactly what store.history_for_model(chat_id) returns. It is the
+    context BEFORE this turn; user_message is the new turn, appended here, so the
+    caller must NOT include user_message in history. None/[] -> single-shot (the
+    pre-memory behavior), so every existing caller is unaffected.
+    """
     if BRAIN == CODER:
         system = f"You are {NAME}, the coding specialist, in manual coding mode. " + _CODER_GUIDE
     else:
@@ -597,8 +605,10 @@ def ask(user_message: str) -> str:
                   f"path; do NOT re-paste the full code. Use web_search for current info, see_image for "
                   f"images, search_datasheets for quick hardware lookups. Refer to yourself as {NAME}.")
 
-    messages = [{"role": "system", "content": system},
-                {"role": "user", "content": user_message}]
+    messages = [{"role": "system", "content": system}]
+    if history:
+        messages.extend(history)                 # prior turns: this is what gives Xorics memory
+    messages.append({"role": "user", "content": user_message})
 
     # Only the coder grind gets human check-ins; the manager just routes (backstop only).
     is_coder = BRAIN == CODER
