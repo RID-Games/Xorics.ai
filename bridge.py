@@ -46,6 +46,7 @@ from fastapi.responses import HTMLResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 import xorics   # pulls in the whole assistant; the REPL is __main__-guarded, so import is safe
+from api import make_router   # app-facing REST API (projects/chats/messages); see api.py
 
 # --- one-time setup ----------------------------------------------------------
 xorics.BRAIN = xorics.MANAGER   # glasses/phone talk to the manager; it routes to the coder itself
@@ -104,11 +105,20 @@ def _completion(text, model):
     }
 
 
-def _run_ask(text):
+def _run_ask(text, history=None):
     # One ask() at a time. A delegate_to_coder run is minutes + two GPU swaps — fine over
     # the phone (it waits), but the glasses/Even Hub will time out on those.
     with _ASK_LOCK:
-        return str(xorics.ask(text))
+        return str(xorics.ask(text, history=history))
+
+
+def _run_ask_full(text, history=None):
+    # Like _run_ask, but keeps the built_path the coder may attach so the app can persist
+    # it on the assistant turn. Same lock, so app turns and glasses turns never drive the
+    # one global brain concurrently.
+    with _ASK_LOCK:
+        r = xorics.ask(text, history=history)
+        return str(r), getattr(r, "built_path", None)
 
 
 async def _chat(request: Request):
@@ -286,6 +296,10 @@ async def upload(request: Request):
 # G2 POSTs to whatever path you set as the Agent URL — canonical path and bare root both work.
 app.post("/v1/chat/completions")(_chat)
 app.post("/")(_chat)
+
+# App-facing API: projects / chats / messages, persisted + memory-backed (api.py).
+# Additive — the OpenAI route above is untouched, so the glasses/Even Hub keep working.
+app.include_router(make_router(_run_ask_full, _auth))
 
 
 @app.get("/healthz")
