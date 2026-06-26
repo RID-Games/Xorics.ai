@@ -29,7 +29,10 @@ existing hand-rolled style rather than introducing Pydantic models. project_id a
 "", "none", or "null" as "loose" (no project), so the app can pass a plain string field.
 """
 
+import base64
+
 from fastapi import APIRouter, Request, HTTPException
+from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
 
 import store
@@ -174,5 +177,86 @@ def make_router(run_ask_full, auth):
         return {"user_message": user_msg,
                 "assistant_message": asst_msg,
                 "chat": store.get_chat(chat_id)}
+
+    # ======================= files (the file-explorer backend) ===========
+    # Persistent storage, distinct from /v1/upload in bridge.py (which is ephemeral
+    # "analyze this now"). These files are project knowledge: stored, listed, organized.
+    @router.post("/v1/files")
+    async def upload_file(request: Request):
+        auth(request)
+        body = await _json(request)
+        filename = (body.get("filename") or "").strip()
+        data_b64 = body.get("data")
+        if not filename or data_b64 is None:
+            raise HTTPException(status_code=400, detail="need 'filename' and base64 'data'")
+        try:
+            raw = base64.b64decode(data_b64)        # lenient: tolerates wrapped base64
+        except Exception:
+            raise HTTPException(status_code=400, detail="'data' is not valid base64")
+        return store.add_file(filename, raw,
+                              project_id=_loose(body.get("project_id")),
+                              folder=body.get("folder") or "/",
+                              mime=body.get("mime") or "")
+
+    @router.get("/v1/files")
+    async def list_files(request: Request):
+        auth(request)
+        qp = request.query_params
+        folder = qp.get("folder")                       # None -> no folder filter
+        if "project_id" not in qp:
+            files = store.list_files(folder=folder)
+        else:
+            files = store.list_files(project_id=_loose(qp.get("project_id")), folder=folder)
+        return {"files": files}
+
+    @router.get("/v1/folders")
+    async def list_folders(request: Request):
+        auth(request)
+        qp = request.query_params
+        if "project_id" not in qp:
+            return {"folders": store.list_folders()}
+        return {"folders": store.list_folders(project_id=_loose(qp.get("project_id")))}
+
+    @router.get("/v1/files/{file_id}")
+    async def get_file_meta(file_id: str, request: Request):
+        auth(request)
+        f = store.get_file(file_id)
+        if not f:
+            raise HTTPException(status_code=404, detail="no such file")
+        return f
+
+    @router.get("/v1/files/{file_id}/content")
+    async def download_file(file_id: str, request: Request):
+        auth(request)
+        f = store.get_file(file_id)
+        if not f:
+            raise HTTPException(status_code=404, detail="no such file")
+        raw = store.read_file_bytes(file_id)
+        return Response(content=raw,
+                        media_type=f["mime"] or "application/octet-stream",
+                        headers={"Content-Disposition": f'attachment; filename="{f["name"]}"'})
+
+    @router.patch("/v1/files/{file_id}")
+    async def update_file(file_id: str, request: Request):
+        auth(request)
+        if not store.get_file(file_id):
+            raise HTTPException(status_code=404, detail="no such file")
+        body = await _json(request)
+        if body.get("name"):
+            store.rename_file(file_id, body["name"])
+        if "folder" in body or "project_id" in body:    # move (folder and/or project)
+            kwargs = {}
+            if "folder" in body:
+                kwargs["folder"] = body["folder"]
+            if "project_id" in body:
+                kwargs["project_id"] = _loose(body["project_id"])
+            store.move_file(file_id, **kwargs)
+        return store.get_file(file_id)
+
+    @router.delete("/v1/files/{file_id}")
+    async def delete_file(file_id: str, request: Request):
+        auth(request)
+        store.delete_file(file_id)
+        return {"deleted": file_id}
 
     return router

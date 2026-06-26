@@ -4,7 +4,7 @@
 # the prior turns and not itself. The live proof (a real reply that remembers) is the
 # curl probe on RIDGames after the bridge restarts. A green TestClient run != that.
 
-import os, tempfile, shutil
+import os, tempfile, shutil, base64
 _TMP = tempfile.mkdtemp(prefix="xorics-api-test-")
 os.environ["XORICS_DATA_DIR"] = _TMP
 
@@ -102,6 +102,48 @@ try:
     c.delete(f"/v1/projects/{pid}")
     check("DELETE project orphans its chat to loose", c.get(f"/v1/chats/{proj_chat['id']}").json()["project_id"] is None)
     check("DELETE project -> project 404 after", c.get(f"/v1/projects/{pid}").status_code == 404)
+
+    # ======================= files =========================================
+    fpid = c.post("/v1/projects", json={"name": "Files proj"}).json()["id"]
+    blob = b"%PDF-1.7 fake datasheet bytes"
+    b64 = base64.b64encode(blob).decode()
+
+    up = c.post("/v1/files", json={"filename": "opt3001.pdf", "data": b64,
+                                   "project_id": fpid, "folder": "datasheets", "mime": "application/pdf"})
+    check("POST /v1/files -> 200", up.status_code == 200)
+    fid = up.json()["id"]
+    check("upload: folder normalized to /datasheets", up.json()["folder"] == "/datasheets")
+    check("upload: size recorded from decoded bytes", up.json()["size"] == len(blob))
+    check("POST /v1/files missing data -> 400", c.post("/v1/files", json={"filename": "x"}).status_code == 400)
+    check("POST /v1/files bad base64 -> 400", c.post("/v1/files", json={"filename": "x", "data": "a"}).status_code == 400)
+
+    # a second file in the project root, and a loose file (no project)
+    c.post("/v1/files", json={"filename": "notes.txt", "data": base64.b64encode(b"hi").decode(), "project_id": fpid})
+    c.post("/v1/files", json={"filename": "loose.bin", "data": base64.b64encode(b"x").decode()})
+
+    check("GET /v1/files (no filter) -> all 3", len(c.get("/v1/files").json()["files"]) == 3)
+    check("GET /v1/files?project_id=<id> -> 2", len(c.get(f"/v1/files?project_id={fpid}").json()["files"]) == 2)
+    check("GET /v1/files?project_id=none -> 1 loose", len(c.get("/v1/files?project_id=none").json()["files"]) == 1)
+    check("GET /v1/files?folder=datasheets -> 1", len(c.get(f"/v1/files?project_id={fpid}&folder=datasheets").json()["files"]) == 1)
+    check("GET /v1/folders shows the tree dirs",
+          c.get(f"/v1/folders?project_id={fpid}").json()["folders"] == ["/", "/datasheets"])
+
+    check("GET /v1/files/{id} metadata -> 200", c.get(f"/v1/files/{fid}").status_code == 200)
+    check("GET unknown file -> 404", c.get("/v1/files/ghost").status_code == 404)
+
+    dl = c.get(f"/v1/files/{fid}/content")
+    check("GET /content returns the exact bytes", dl.content == blob)
+    check("GET /content sets a download filename", "opt3001.pdf" in dl.headers.get("content-disposition", ""))
+    check("GET /content of unknown file -> 404", c.get("/v1/files/ghost/content").status_code == 404)
+
+    check("PATCH move file to another folder", c.patch(f"/v1/files/{fid}", json={"folder": "archive"}).json()["folder"] == "/archive")
+    check("PATCH move file to loose (no project)", c.patch(f"/v1/files/{fid}", json={"project_id": "none"}).json()["project_id"] is None)
+    rn = c.patch(f"/v1/files/{fid}", json={"name": "OPT3001.pdf"}).json()
+    check("PATCH rename file updates name", rn["name"] == "OPT3001.pdf")
+    check("renamed file still downloads the same bytes", c.get(f"/v1/files/{fid}/content").content == blob)
+
+    c.delete(f"/v1/files/{fid}")
+    check("DELETE file -> 404 after", c.get(f"/v1/files/{fid}").status_code == 404)
 
 finally:
     shutil.rmtree(_TMP, ignore_errors=True)
