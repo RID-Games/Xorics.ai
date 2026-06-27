@@ -21,7 +21,7 @@ Wiring (in bridge.py):
 
 make_router takes two INJECTED callables, so this module never imports bridge (which
 would be a circular import) and so the single ask()-serializing lock is shared:
-    run_ask_full(text, history) -> (reply_text, built_path)   # holds bridge's _ASK_LOCK
+    run_ask_full(text, history) -> (reply_text, built_path, deliverables)   # holds bridge's _ASK_LOCK
     auth(request) -> None                                      # raises HTTPException on bad token
 
 Body is read with await request.json() (tolerant of an empty body) to match bridge.py's
@@ -30,6 +30,8 @@ existing hand-rolled style rather than introducing Pydantic models. project_id a
 """
 
 import base64
+import mimetypes
+import os
 
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import Response
@@ -49,6 +51,11 @@ async def _json(request):
 def _loose(pid):
     """Normalize the app's 'no project' sentinels to a real None."""
     return None if pid in ("", "none", "null") else pid
+
+
+# Logical folder the coder's verified deliverables land in, so they're grouped and distinguishable
+# from user uploads in the file explorer. XORICS-FEATURE: deliverables-to-store
+_DELIVERABLES_FOLDER = "/deliverables"
 
 
 def make_router(run_ask_full, auth):
@@ -167,8 +174,31 @@ def make_router(run_ask_full, auth):
         first_turn = len(history) == 0
         user_msg = store.add_message(chat_id, "user", content)
 
-        text, built = await run_in_threadpool(run_ask_full, content, history)
+        text, built, deliverables = await run_in_threadpool(run_ask_full, content, history)
         asst_msg = store.add_message(chat_id, "assistant", text, built_path=built)
+
+        # Mirror any deliverable the coder verified to disk THIS turn into the project file store, so
+        # it shows up in the app's file explorer — the coder saves to sketches/ or circuits/, which the
+        # app never sees otherwise. Files are project-scoped; a loose chat -> loose files. Skip-if-name-
+        # exists stops a re-run of the same task from spamming duplicates. Best-effort: a mirror failure
+        # must never fail the chat turn (the file still exists on disk regardless). XORICS-FEATURE: deliverables-to-store
+        saved_files = []
+        existing = ({f["name"] for f in store.list_files(project_id=chat.get("project_id"),
+                                                         folder=_DELIVERABLES_FOLDER)}
+                    if deliverables else set())
+        for path in deliverables:
+            name = os.path.basename(path)
+            if name in existing:
+                continue
+            try:
+                with open(os.path.expanduser(path), "rb") as fh:
+                    raw = fh.read()
+                saved_files.append(store.add_file(name, raw, project_id=chat.get("project_id"),
+                                                  folder=_DELIVERABLES_FOLDER,
+                                                  mime=mimetypes.guess_type(name)[0] or "text/plain"))
+                existing.add(name)
+            except Exception as e:
+                print(f"  [api] could not mirror deliverable {name} to store: {e}")
 
         # Name a brand-new chat after its first message so the history list isn't all "New chat".
         if first_turn and chat["title"] == "New chat":
@@ -176,6 +206,7 @@ def make_router(run_ask_full, auth):
 
         return {"user_message": user_msg,
                 "assistant_message": asst_msg,
+                "files": saved_files,
                 "chat": store.get_chat(chat_id)}
 
     # ======================= files (the file-explorer backend) ===========

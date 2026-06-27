@@ -113,12 +113,17 @@ def _run_ask(text, history=None):
 
 
 def _run_ask_full(text, history=None):
-    # Like _run_ask, but keeps the built_path the coder may attach so the app can persist
-    # it on the assistant turn. Same lock, so app turns and glasses turns never drive the
-    # one global brain concurrently.
+    # Like _run_ask, but ALSO returns the deliverables the coder verified to disk THIS turn, so the
+    # caller (api.py) can mirror them into the project file store and the app can actually see them.
+    # built_path stays for back-compat, but it's the MANAGER's path and is ~always None on a delegated
+    # build — the reliable source is the honesty-ledger diff, taken here INSIDE the lock (so a
+    # concurrent turn can't muddy the before/after) around this one ask() call. XORICS-FEATURE: deliverables-to-store
     with _ASK_LOCK:
+        _deliv_before = len(xorics._load_deliverables())
         r = xorics.ask(text, history=history)
-        return str(r), getattr(r, "built_path", None)
+        fresh = [d["path"] for d in xorics._load_deliverables()[_deliv_before:]
+                 if os.path.exists(os.path.expanduser(d["path"]))]
+        return str(r), getattr(r, "built_path", None), fresh
 
 
 async def _chat(request: Request):
