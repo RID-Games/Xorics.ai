@@ -35,6 +35,7 @@ Config (env, all optional):
 import os
 import time
 import uuid
+import base64
 import threading
 import tempfile
 import subprocess
@@ -45,6 +46,7 @@ from fastapi.responses import HTMLResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 import xorics   # pulls in the whole assistant; the REPL is __main__-guarded, so import is safe
+from api import make_router   # app-facing REST API (projects/chats/messages); see api.py
 
 # --- one-time setup ----------------------------------------------------------
 xorics.BRAIN = xorics.MANAGER   # glasses/phone talk to the manager; it routes to the coder itself
@@ -58,6 +60,7 @@ _TOKEN = os.environ.get("XORICS_BRIDGE_TOKEN")
 
 WHISPER_URL = os.environ.get("XORICS_WHISPER_URL", "http://127.0.0.1:8084/inference")
 KOKORO_URL = os.environ.get("XORICS_KOKORO_URL", "http://127.0.0.1:8880/v1/audio/speech")
+VLM_URL = os.environ.get("XORICS_VLM_URL", "http://127.0.0.1:8081/v1/chat/completions")
 TTS_VOICE = os.environ.get("XORICS_TTS_VOICE", "bm_fable")
 
 app = FastAPI(title="Xorics bridge")
@@ -102,11 +105,20 @@ def _completion(text, model):
     }
 
 
-def _run_ask(text):
+def _run_ask(text, history=None):
     # One ask() at a time. A delegate_to_coder run is minutes + two GPU swaps — fine over
     # the phone (it waits), but the glasses/Even Hub will time out on those.
     with _ASK_LOCK:
-        return str(xorics.ask(text))
+        return str(xorics.ask(text, history=history))
+
+
+def _run_ask_full(text, history=None):
+    # Like _run_ask, but keeps the built_path the coder may attach so the app can persist
+    # it on the assistant turn. Same lock, so app turns and glasses turns never drive the
+    # one global brain concurrently.
+    with _ASK_LOCK:
+        r = xorics.ask(text, history=history)
+        return str(r), getattr(r, "built_path", None)
 
 
 async def _chat(request: Request):
@@ -191,10 +203,103 @@ async def page():
     return _PAGE
 
 
+# --- uploads: files + photos (one path; branch on type server-side) ----------
+# The app uploads JSON {filename, prompt, data(base64)}. Everything is handled here:
+# images go to the VLM (:8081); every other type is turned into text and fed to the
+# same ask() the chat route uses. The app never needs to know which branch ran.
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
+
+
+def _vlm(image_bytes, mime, prompt):
+    """Image -> Gemma VLM on :8081 (OpenAI vision format) -> answer text."""
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    r = httpx.post(
+        VLM_URL,
+        json={
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt or "Describe this image in detail."},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:{mime or 'image/jpeg'};base64,{b64}"}},
+                ],
+            }],
+            "temperature": 0.2,
+            "max_tokens": 512,
+        },
+        timeout=180,
+    )
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"vlm {r.status_code}: {r.text[:200]}")
+    return (r.json()["choices"][0]["message"]["content"] or "").strip()
+
+
+def _file_to_text(data, ext):
+    """Uploaded non-image file -> text for gpt-oss.
+
+    Plain text decodes directly. PDF/DOCX use lazy imports, so a missing parser
+    library degrades to a clear 501 instead of breaking the bridge at startup.
+    """
+    ext = (ext or "").lower()
+    if ext == ".pdf":
+        try:
+            import io
+            import pypdf
+        except ImportError:
+            raise HTTPException(status_code=501, detail="PDF needs: pip install pypdf")
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        return "\n".join((p.extract_text() or "") for p in reader.pages).strip()
+    if ext == ".docx":
+        try:
+            import io
+            import docx
+        except ImportError:
+            raise HTTPException(status_code=501, detail="DOCX needs: pip install python-docx")
+        d = docx.Document(io.BytesIO(data))
+        return "\n".join(p.text for p in d.paragraphs).strip()
+    try:
+        return data.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=415, detail=f"no text parser for '{ext}'")
+
+
+def _upload_answer(name, prompt, data):
+    ext = os.path.splitext(name or "")[1].lower()
+    if ext in IMAGE_EXTS:
+        mime = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/" + ext.lstrip(".")
+        return _vlm(data, mime, prompt)
+    text = _file_to_text(data, ext)
+    if not text:
+        raise HTTPException(status_code=422, detail="no text extracted from file")
+    prefix = (prompt.strip() + "\n\n") if (prompt and prompt.strip()) else ""
+    return _run_ask(prefix + f"[file: {name}]\n{text}")
+
+
+@app.post("/v1/upload")
+async def upload(request: Request):
+    _auth(request)
+    body = await request.json()
+    b64 = body.get("data")
+    if not b64:
+        raise HTTPException(status_code=400, detail="no 'data' (base64) in body")
+    try:
+        data = base64.b64decode(b64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="bad base64 in 'data'")
+    name = body.get("filename") or ""
+    prompt = body.get("prompt") or ""
+    text = await run_in_threadpool(_upload_answer, name, prompt, data)
+    return {"text": text}
+
+
 # --- chat routes + aux -------------------------------------------------------
 # G2 POSTs to whatever path you set as the Agent URL — canonical path and bare root both work.
 app.post("/v1/chat/completions")(_chat)
 app.post("/")(_chat)
+
+# App-facing API: projects / chats / messages, persisted + memory-backed (api.py).
+# Additive — the OpenAI route above is untouched, so the glasses/Even Hub keep working.
+app.include_router(make_router(_run_ask_full, _auth))
 
 
 @app.get("/healthz")

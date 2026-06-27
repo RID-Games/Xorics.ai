@@ -1017,19 +1017,25 @@ def _append_manifest_footer(text, outcome, deliv_before):
 
 
 # ---- The agent loop -----------------------------------------------------------
-def ask(user_message: str) -> str:
+def ask(user_message: str, history=None) -> str:
+    """One turn of conversation.
+
+    history: prior turns as [{"role": "user"|"assistant", "content": str}, ...], oldest first —
+    the context BEFORE this turn (store.history_for_model(chat_id) for the bridge/app, or the
+    REPL's own recent slice). user_message is the NEW turn, appended here, so the caller must NOT
+    include it in history. None/[] -> single-shot. ask() is STATELESS: it never reads or writes a
+    global transcript, so persistence is the caller's job — store.py for the app, the REPL for the
+    console. Existing single-arg callers are unaffected. XORICS-FEATURE: stateless-history
+    """
     is_coder = BRAIN == CODER
     if is_coder:
         system = f"You are {NAME}, the coding specialist, in manual coding mode. " + _CODER_GUIDE
-        # Coder mode is task-scoped: each request is its own deliverable, no transcript.
-        messages = [{"role": "system", "content": system},
-                    {"role": "user", "content": user_message}]
     else:
         system = _MANAGER_PERSONA + "\n\n" + _MANAGER_ROUTING
-        # Manager mode carries the conversation so earlier turns are remembered.
-        messages = [{"role": "system", "content": system},
-                    *_CHAT_HISTORY[-CHAT_HISTORY_MSGS:],
-                    {"role": "user", "content": user_message}]
+    messages = [{"role": "system", "content": system}]
+    if history:                                  # prior turns: spliced between system and the new turn
+        messages.extend(history)
+    messages.append({"role": "user", "content": user_message})
 
     # Only the coder grind gets human check-ins; the manager just routes (backstop only).
     _deliv_before = len(_load_deliverables())    # honesty-gate: footer diffs deliverables added this turn
@@ -1043,7 +1049,6 @@ def ask(user_message: str) -> str:
                 final_text += f"\n[Xorics snapshotted the in-progress design to: {snap}]"
     else:
         final_text = _append_manifest_footer(final_text, outcome, _deliv_before)   # honesty gate
-        _remember(user_message, final_text)   # only the manager accrues a transcript
     out = _ToolResult(final_text)        # str-compatible; carries built_path for the REPL save
     out.built_path = built_path
     return out
@@ -1095,7 +1100,10 @@ if __name__ == "__main__":
             elif q == "/reset" or q == "/new":
                 reset_history(); print("→ conversation cleared — fresh context\n")
                 continue
-            ans = ask(q)
+            # manager/power turns carry the running transcript (persisted by _remember); coder turns
+            # are task-scoped, no history. ask() is stateless now, so the REPL owns this. 
+            hist = None if BRAIN == CODER else _CHAT_HISTORY[-CHAT_HISTORY_MSGS:]
+            ans = ask(q, history=hist)
             print(f"\n{NAME.lower()}>", ans, "\n")
             if BRAIN == CODER:                       # direct-drive: save the deliverable too
                 bp = getattr(ans, "built_path", None)
@@ -1105,6 +1113,8 @@ if __name__ == "__main__":
                     p = _save_deliverable(ans, q)
                     if p:
                         print(f"  [saved] {p}\n")
+            else:
+                _remember(q, str(ans))               # accrue + persist the manager transcript
         except (KeyboardInterrupt, EOFError):
             print(f"\n{NAME} signing off.")
             break
