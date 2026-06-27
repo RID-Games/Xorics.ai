@@ -152,6 +152,11 @@ def _validate_circuit_from_turn(messages, name, seen_sha1s):
 NAME = "Xorics"
 MANAGER = "gpt-oss"
 CODER = "qwen3-coder"
+# "Power mode" (/power): swap the MANAGER brain from local gpt-oss to a remote frontier
+# model. MiniMax M3 speaks the OpenAI tool-calling format, so it drops into this same loop
+# with no adapter. The coder stays local (qwen3-coder) — that's the token-heavy half, so
+# power mode only spends API credits on the brain, not the grind. XORICS-FEATURE: power-mode
+MINIMAX = "MiniMax-M3"
 
 # Coder loop pacing. No hard step cap — instead, in an interactive session the coder
 # pauses for a human check-in this often; with no TTY it stops at the backstop so an
@@ -165,6 +170,15 @@ RESEARCH_NUDGE_EVERY = 6    # if it keeps stalling, re-nudge every N further loo
 client = OpenAI(base_url="http://127.0.0.1:9090/v1", api_key="not-needed")
 # Vision specialist, reached directly (CPU, always on).
 vision_client = OpenAI(base_url="http://127.0.0.1:8081/v1", api_key="not-needed")
+# Remote frontier brain for /power (MiniMax M3). Key from the env — NEVER hardcoded; empty
+# string if unset, and /power refuses to switch without it. XORICS-FEATURE: power-mode
+minimax_client = OpenAI(base_url="https://api.minimax.io/v1",
+                        api_key=os.environ.get("MINIMAX_API_KEY", ""))
+
+
+def client_for(model):
+    """Route a model name to its endpoint: MiniMax is remote, everything else is local llama-swap."""
+    return minimax_client if model == MINIMAX else client
 
 # Active manager-side brain. "/code" drives the coder directly; normally gpt-oss
 # delegates to it instead.
@@ -672,7 +686,12 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
             # cannot keep researching — it must write or stop. Restores automatically when a validated
             # circuit resets research_streak to 0. XORICS-FEATURE: convergence-guard
             active = [t for t in tools if t["function"]["name"] not in _SOFT_RESEARCH_TOOLS]
-        resp = client.chat.completions.create(model=model, messages=messages, tools=active)
+        # MiniMax M3 buries its chain-of-thought inside `content` as <think>…</think> unless
+        # asked to split it out — which would pollute the honesty gate + SKiDL-fence parsing.
+        # reasoning_split keeps `content` clean. Empty extra_body is a no-op for local models.
+        extra = {"reasoning_split": True} if model == MINIMAX else {}
+        resp = client_for(model).chat.completions.create(
+            model=model, messages=messages, tools=active, extra_body=extra)
         msg = resp.choices[0].message
         if not msg.tool_calls:
             final_text = msg.content or ""
@@ -841,9 +860,9 @@ def run_coder(task: str) -> str:
 
 def delegate_to_coder(task: str) -> str:
     """Manager-side tool: hand off to the coder, then return its result (a swap each way)."""
-    print(f"  [handoff] {MANAGER} → {CODER}: {task[:70]}")
+    print(f"  [handoff] {BRAIN} → {CODER}: {task[:70]}")
     result = run_coder(task)
-    print(f"  [handoff] {CODER} → {MANAGER} (done; control returned)")
+    print(f"  [handoff] {CODER} → {BRAIN} (done; control returned)")
     return result
 
 
@@ -1039,13 +1058,13 @@ if __name__ == "__main__":
         sys.exit()
 
     print(f"{NAME} — local AI. The manager delegates coding to the coder automatically.")
-    print("commands: /code (drive coder directly)  /chat (manager)  /reset (clear memory)  Ctrl+C quit")
+    print("commands: /code (coder)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
     print(f"coder pauses every {CHECKPOINT_EVERY} steps to check in (no cap); backstop {CODER_BACKSTOP} when unattended.\n")
     if _CHAT_HISTORY:
         print(f"(resumed {len(_CHAT_HISTORY)} remembered messages — /reset to start fresh)\n")
     while True:
         try:
-            tag = "code" if BRAIN == CODER else "chat"
+            tag = "code" if BRAIN == CODER else ("power" if BRAIN == MINIMAX else "chat")
             q = input(f"you[{tag}]> ").strip()
             if not q:
                 continue
@@ -1057,6 +1076,20 @@ if __name__ == "__main__":
             elif q == "/chat" or q.startswith("/chat "):
                 BRAIN = MANAGER; print("→ manager mode (gpt-oss; delegates coding)\n")
                 q = q[5:].strip()
+                if not q:
+                    continue
+            elif q == "/power" or q.startswith("/power "):   # XORICS-FEATURE: power-mode
+                if os.environ.get("MINIMAX_API_KEY"):
+                    BRAIN = MINIMAX
+                    print(f"→ POWER mode (manager = {MINIMAX}, remote; coder stays local on {CODER})\n")
+                else:
+                    print("✗ MINIMAX_API_KEY not set — export it (and set a spend cap) first. Staying put.\n")
+                q = q[6:].strip()
+                if not q:
+                    continue
+            elif q == "/local" or q.startswith("/local "):   # off-switch for /power (same as /chat)
+                BRAIN = MANAGER; print(f"→ local manager mode ({MANAGER})\n")
+                q = q[6:].strip()
                 if not q:
                     continue
             elif q == "/reset" or q == "/new":
