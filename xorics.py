@@ -854,11 +854,18 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
             final_text = stopped_msg
             break
         if built_code is not None:
-            print("    ✓ CIRCUIT BUILT — finalizing the verified design and stopping the coder.")
-            final_text = (
-                "check_circuit returned BUILT — ERC ran and a netlist generated. Stopping here with the "
-                "verified design (further edits are disabled so a passing board can't be broken).\n\n"
-                "```python\n" + (built_code or "") + "\n```")
+            if wants_circuit:                        # PCB build: ERC + netlist actually ran  XORICS-FEATURE: pcb-firmware-distinct
+                print("    ✓ CIRCUIT BUILT — finalizing the verified design and stopping the coder.")
+                final_text = (
+                    "check_circuit returned BUILT — ERC ran and a netlist generated. Stopping here with the "
+                    "verified design (further edits are disabled so a passing board can't be broken).\n\n"
+                    "```python\n" + (built_code or "") + "\n```")
+            else:                                    # firmware: compile_check passed — NOT a circuit, no ERC/netlist
+                print("    ✓ SKETCH COMPILED — finalizing the verified firmware and stopping the coder.")
+                final_text = (
+                    "compile_check returned COMPILE OK — the sketch builds clean. Stopping here with the "
+                    "verified firmware (further edits are disabled so a passing build can't be broken).\n\n"
+                    "```cpp\n" + (built_code or "") + "\n```")
             break
     return final_text, messages, built_path, {"built": built_happened, "design_attempt": design_attempt}
 
@@ -1044,7 +1051,7 @@ def finalize_design(paths=None):
                            + ", ".join(unvalidated) + ". Run them through check_circuit_file first.",
                            "unverified")
     listing = "\n".join(f"  - {r['path']}  [{r['validator']}]" for r in manifest)
-    return _ToolResult("VERIFIED — a board BUILT this session and every claimed file exists on disk.\n"
+    return _ToolResult("VERIFIED — every claimed deliverable built/compiled this session and exists on disk.\n"
                        "Verified deliverables:\n" + listing, "verified")
 
 TOOL_IMPLS["finalize_design"] = finalize_design   # register now that it's defined
@@ -1059,7 +1066,7 @@ def _append_manifest_footer(text, outcome, deliv_before):
     on_disk = [r for r in fresh if os.path.exists(os.path.expanduser(r["path"]))]
     if on_disk:
         files = ", ".join(os.path.basename(r["path"]) for r in on_disk)
-        return text + "\n\n\u2713 VERIFIED — a board BUILT this turn; verified on disk: " + files
+        return text + "\n\n\u2713 VERIFIED — built and verified on disk this turn: " + files
     return text + ("\n\n\u26a0 UNVERIFIED — a design task ran but nothing passed a validator and no new "
                    "file was verified to disk this turn. Any 'complete' claim or file paths above are "
                    "unconfirmed.")
