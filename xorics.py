@@ -393,6 +393,15 @@ CODER_TOOLS = [t for t in TOOLS if t["function"]["name"]
                in ("compile_check", "check_circuit_file", "validate_circuit",
                    "find_part", "part_pins", "find_footprint",
                    "search_datasheets", "fetch_datasheet", "web_search", "read_file")]
+# Firmware-only subset of the coder's tools. A delegated firmware task (firmware signal, NO circuit
+# signal) gets THIS instead of CODER_TOOLS, so the PCB design/validate tools (find_part, part_pins,
+# find_footprint, validate_circuit, check_circuit_file) are simply absent — a weak coder then physically
+# CANNOT wander into SKiDL on a firmware job (the routing bug). The manager always splits firmware vs PCB
+# into separate delegations, so a firmware delegation never legitimately needs the PCB tools. compile_check
+# stays; web_search / datasheets / read_file stay for looking up library APIs and register maps, and the
+# convergence guard still drops the soft look-ups if it over-researches. XORICS-FEATURE: pcb-firmware-distinct
+FIRMWARE_TOOLS = [t for t in TOOLS if t["function"]["name"]
+                  in ("compile_check", "search_datasheets", "fetch_datasheet", "web_search", "read_file")]
 
 # A turn that fires any of these attempted a design/build — used to scope the honesty-gate
 # footer so it never fires on plain chat. XORICS-FEATURE: honesty-gate
@@ -437,6 +446,20 @@ def _task_wants_circuit(messages):
     """
     task = (messages[1].get("content") or "").lower() if len(messages) > 1 else ""
     return bool(re.search(r"\b(schematic|bom|pcb|circuit|netlist|kicad|skidl|footprint)\b", task))
+
+
+def _task_wants_firmware(messages):
+    """True if the delegated task asks for a FIRMWARE deliverable (an Arduino / ESP sketch) — the mirror
+    of _task_wants_circuit. Used ONLY as `_task_wants_firmware(...) and not _task_wants_circuit(...)` to
+    detect a firmware-ONLY task and strip the PCB tools for that run. Conservative whole-word match keyed
+    on explicit firmware-deliverable language; any genuine board delegation carries a circuit keyword
+    (schematic/pcb/bom/...) and so wins the `and not` regardless of incidental firmware-ish words. The
+    manager always splits firmware vs PCB into separate delegations, so this never has to disambiguate a
+    single mixed delegation. A task that names neither (e.g. plain script work) stays on the full toolset.
+    XORICS-FEATURE: pcb-firmware-distinct
+    """
+    task = (messages[1].get("content") or "").lower() if len(messages) > 1 else ""
+    return bool(re.search(r"\b(firmware|arduino|sketch|\.ino|esp-?idf|platformio|compile_check)\b", task))
 
 
 # Pushed back at the coder when a firmware compile tries to stand in for a board (closes the off-ramp
@@ -507,6 +530,19 @@ _CODER_GUIDE = (
     "- When validate_circuit returns BUILT, you are DONE: do NOT swap parts, refactor, or \"improve\" a "
     "passing design — output the final code and stop. A built board you keep editing is how good ones break.\n"
     "Finish with the final code in a single fenced block, then one short line: what it does and the pins/specs used."
+)
+
+# Compact firmware-only guide — used INSTEAD of the (PCB-dominated, ~45-line) _CODER_GUIDE when a task is
+# firmware-only, so the coder isn't primed toward SKiDL and we don't burn the 8K context window on PCB
+# rules it can't act on (the PCB tools are gone for this run). XORICS-FEATURE: pcb-firmware-distinct
+_FIRMWARE_GUIDE = (
+    "This is a FIRMWARE task. Write an Arduino sketch (C++). Call compile_check and fix from its REAL "
+    "errors until it builds — ITERATE, don't one-shot, exactly the way the PCB path iterates on a validator. "
+    "Use web_search / search_datasheets only for an API, library, or register map you're genuinely unsure "
+    "of; don't over-research — after too many look-ups without compiling you'll be told to stop and write. "
+    "You do NOT design a SKiDL circuit here and you have no find_part / find_footprint / validate_circuit — "
+    "if the job seems to need a board, that is a SEPARATE delegation, not this one. Finish with the final "
+    "code in ONE fenced ```cpp block, then one short line: what it does and the pins used."
 )
 
 
@@ -818,24 +854,44 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
             final_text = stopped_msg
             break
         if built_code is not None:
-            print("    ✓ CIRCUIT BUILT — finalizing the verified design and stopping the coder.")
-            final_text = (
-                "check_circuit returned BUILT — ERC ran and a netlist generated. Stopping here with the "
-                "verified design (further edits are disabled so a passing board can't be broken).\n\n"
-                "```python\n" + (built_code or "") + "\n```")
+            if wants_circuit:                        # PCB build: ERC + netlist actually ran  XORICS-FEATURE: pcb-firmware-distinct
+                print("    ✓ CIRCUIT BUILT — finalizing the verified design and stopping the coder.")
+                final_text = (
+                    "check_circuit returned BUILT — ERC ran and a netlist generated. Stopping here with the "
+                    "verified design (further edits are disabled so a passing board can't be broken).\n\n"
+                    "```python\n" + (built_code or "") + "\n```")
+            else:                                    # firmware: compile_check passed — NOT a circuit, no ERC/netlist
+                print("    ✓ SKETCH COMPILED — finalizing the verified firmware and stopping the coder.")
+                final_text = (
+                    "compile_check returned COMPILE OK — the sketch builds clean. Stopping here with the "
+                    "verified firmware (further edits are disabled so a passing build can't be broken).\n\n"
+                    "```cpp\n" + (built_code or "") + "\n```")
             break
     return final_text, messages, built_path, {"built": built_happened, "design_attempt": design_attempt}
 
 
 # ---- The coder sub-session (runs on the coder brain, returns a saved file) -----
 def run_coder(task: str) -> str:
-    """Run the coder brain on `task` until it produces verified code, save it, return summary+path."""
+    """Run the coder brain on `task` until it produces verified code, save it, return summary+path.
+    A firmware-ONLY task (firmware signal present, NO circuit signal) runs on a firmware-led prompt with
+    the PCB design/validate tools removed, so a weak coder can't misroute into SKiDL — the manager always
+    splits firmware vs PCB into separate delegations, so that's safe. Anything else keeps the full coder
+    toolset + the firmware-AND-PCB guide as before. XORICS-FEATURE: pcb-firmware-distinct
+    """
     messages = [
-        {"role": "system",
-         "content": "You are the Xorics coding specialist (qwen3-coder), a firmware AND PCB co-pilot. " + _CODER_GUIDE},
+        {"role": "system", "content": ""},       # set below, once the task is typed
         {"role": "user", "content": task},
     ]
-    final_text, messages, built_path, outcome = _agent_loop(CODER, messages, CODER_TOOLS, checkpoint=True, tag="coder")
+    firmware_only = _task_wants_firmware(messages) and not _task_wants_circuit(messages)
+    if firmware_only:
+        messages[0]["content"] = ("You are the Xorics coding specialist (qwen3-coder), a firmware "
+                                  "co-pilot. " + _FIRMWARE_GUIDE)
+        coder_tools = FIRMWARE_TOOLS              # PCB tools dropped → can't misroute a firmware task
+    else:
+        messages[0]["content"] = ("You are the Xorics coding specialist (qwen3-coder), a firmware AND "
+                                  "PCB co-pilot. " + _CODER_GUIDE)
+        coder_tools = CODER_TOOLS
+    final_text, messages, built_path, outcome = _agent_loop(CODER, messages, coder_tools, checkpoint=True, tag="coder")
 
     if final_text.startswith("(stopped"):
         snap = _snapshot_wip(messages, task)
@@ -995,7 +1051,7 @@ def finalize_design(paths=None):
                            + ", ".join(unvalidated) + ". Run them through check_circuit_file first.",
                            "unverified")
     listing = "\n".join(f"  - {r['path']}  [{r['validator']}]" for r in manifest)
-    return _ToolResult("VERIFIED — a board BUILT this session and every claimed file exists on disk.\n"
+    return _ToolResult("VERIFIED — every claimed deliverable built/compiled this session and exists on disk.\n"
                        "Verified deliverables:\n" + listing, "verified")
 
 TOOL_IMPLS["finalize_design"] = finalize_design   # register now that it's defined
@@ -1010,7 +1066,7 @@ def _append_manifest_footer(text, outcome, deliv_before):
     on_disk = [r for r in fresh if os.path.exists(os.path.expanduser(r["path"]))]
     if on_disk:
         files = ", ".join(os.path.basename(r["path"]) for r in on_disk)
-        return text + "\n\n\u2713 VERIFIED — a board BUILT this turn; verified on disk: " + files
+        return text + "\n\n\u2713 VERIFIED — built and verified on disk this turn: " + files
     return text + ("\n\n\u26a0 UNVERIFIED — a design task ran but nothing passed a validator and no new "
                    "file was verified to disk this turn. Any 'complete' claim or file paths above are "
                    "unconfirmed.")
