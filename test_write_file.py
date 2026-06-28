@@ -164,11 +164,17 @@ xorics._agent_loop = _fake_loop
 try:
     r = xorics.run_self_edit("rename a var in notebook.py")
     check("run_self_edit returns the coder's final text", r == "done: changed notebook.py")
-    check("run_self_edit runs on the CODER brain", seen.get("model") == xorics.CODER)
+    check("run_self_edit defaults to the local CODER brain", seen.get("model") == xorics.CODER)
     check("run_self_edit hands over ONLY the self-edit toolset", seen.get("tools") is xorics.SELF_EDIT_TOOLS)
     check("run_self_edit uses the 'selfedit' tag (keeps the PCB convergence nudge inert)",
           seen.get("tag") == "selfedit")
     check("self-edit system prompt carries the self-edit guide", "OWN source code" in seen.get("sys", ""))
+    # power mode: an explicit brain (MiniMax M3) drives the SAME loop/toolset  XORICS-FEATURE: power-mode
+    seen.clear()
+    xorics.run_self_edit("edit a big file", brain=xorics.MINIMAX)
+    check("run_self_edit(brain=MINIMAX) drives on M3", seen.get("model") == xorics.MINIMAX)
+    check("M3 self-edit still uses ONLY the self-edit toolset", seen.get("tools") is xorics.SELF_EDIT_TOOLS)
+    check("M3 self-edit still uses the 'selfedit' tag", seen.get("tag") == "selfedit")
 finally:
     xorics._agent_loop = _saved_loop
 

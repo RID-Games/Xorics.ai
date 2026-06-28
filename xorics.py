@@ -1270,11 +1270,13 @@ _SELF_EDIT_GUIDE = (
     "boards, or write firmware here.")
 
 
-def run_self_edit(task: str) -> str:
-    """Run the coder on a self-edit `task` with ONLY read_file + write_file. Each proposed write is
-    applied to a COPY of the repo and verified by the full suite in a sandbox; the live tree is never
-    mutated here (promotion is the approval gate, Brick C). Returns the coder's final report.
-    XORICS-FEATURE: self-edit"""
+def run_self_edit(task: str, brain=None) -> str:
+    """Run a self-edit `task` with ONLY read_file + write_file, on `brain` (default the local coder;
+    pass MINIMAX to drive big-file edits on the remote frontier brain — the local coder's 8K context
+    can't hold a large file like xorics.py to rewrite it, M3's can). Each proposed write is applied to
+    a COPY of the repo and verified by the full suite in a sandbox; the live tree is never mutated here
+    (promotion is the approval gate, Brick C). Returns the driver's final report. XORICS-FEATURE: self-edit"""
+    brain = brain or CODER
     _selfedit_reset()                            # fresh copy of the live tree for this session
     os.makedirs(_SELFEDIT_WORKSPACE, exist_ok=True)
     try:
@@ -1283,11 +1285,11 @@ def run_self_edit(task: str) -> str:
         pass
     messages = [
         {"role": "system",
-         "content": f"You are the {NAME} coding specialist ({CODER}). " + _SELF_EDIT_GUIDE},
+         "content": f"You are the {NAME} coding specialist ({brain}). " + _SELF_EDIT_GUIDE},
         {"role": "user", "content": task},
     ]
     final_text, messages, _built, _outcome = _agent_loop(
-        CODER, messages, SELF_EDIT_TOOLS, checkpoint=True, tag="selfedit")
+        brain, messages, SELF_EDIT_TOOLS, checkpoint=True, tag="selfedit")
     pending = _selfedit_changed_files()          # XORICS-FEATURE: self-edit (approval gate)
     if pending:
         final_text += ("\n\n[Verified change staged: " + ", ".join(pending) + ". Review and apply "
@@ -1493,7 +1495,7 @@ if __name__ == "__main__":
         sys.exit()
 
     print(f"{NAME} — local AI. The manager delegates coding to the coder automatically.")
-    print("commands: /code (coder)  /selfedit (coder edits Xorics, sandbox-verified)  /promote /discard (approve or drop a self-edit)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
+    print("commands: /code (coder)  /selfedit (edit Xorics, sandbox-verified; /power first → drive on M3)  /promote /discard (approve or drop a self-edit)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
     print(f"coder pauses every {CHECKPOINT_EVERY} steps to check in (no cap); backstop {CODER_BACKSTOP} when unattended.\n")
     if _CHAT_HISTORY:
         print(f"(resumed {len(_CHAT_HISTORY)} remembered messages — /reset to start fresh)\n")
@@ -1533,11 +1535,14 @@ if __name__ == "__main__":
             elif q == "/selfedit" or q.startswith("/selfedit "):   # XORICS-FEATURE: self-edit
                 task = q[9:].strip()
                 if not task:
-                    print("usage: /selfedit <what to change in Xorics's own code>\n")
+                    print("usage: /selfedit <what to change in Xorics's own code>  "
+                          "(run /power first to drive big-file edits on MiniMax M3)\n")
                     continue
-                print("→ self-edit mode (coder edits Xorics's own code; every write is sandbox-verified "
-                      "and the live tree is untouched until you approve)\n")
-                ans = run_self_edit(task)
+                driver = MINIMAX if BRAIN == MINIMAX else CODER   # XORICS-FEATURE: power-mode
+                where = "MiniMax M3, remote" if driver == MINIMAX else f"{driver}, local"
+                print(f"→ self-edit mode (driver: {where}; every write is sandbox-verified, the live "
+                      "tree untouched until you approve)\n")
+                ans = run_self_edit(task, brain=driver)
                 print(f"\n{NAME.lower()}>", ans, "\n")
                 continue
             elif q == "/promote" or q.startswith("/promote "):   # XORICS-FEATURE: self-edit (approval gate)
