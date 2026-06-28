@@ -58,6 +58,7 @@ from firmware_tools import compile_check, save_sketch
 from notebook import Notebook                                              # XORICS-FEATURE: coder-notebook
 from pcb_tools import check_circuit, check_circuit_file, find_part, find_footprint, part_pins, save_circuit   # SKiDL: search + run ERC
 import skills                                       # XORICS-FEATURE: skill-write-on-success
+import sandbox                                       # XORICS-FEATURE: self-edit (throwaway-container verify)
 
 
 class _ToolResult(str):
@@ -252,6 +253,122 @@ def read_file(path: str, max_chars: int = 20000) -> str:
     return f"----- contents of {fp} -----\n{data}"
 
 
+# ---- self-edit: write a repo file into a sandbox COPY and verify it -----------
+# Brick B of the self-edit keystone. The coder proposes a file write; we apply it to
+# a COPY of the repo (the live tree is NEVER touched), run the FULL suite in a
+# throwaway container (sandbox.run -> the honesty gate, generalized), and report
+# success ONLY if the suite exits 0 AND the file actually differs from the live
+# version. The verify command is NOT model-controlled, so a weak coder cannot pass
+# `exit 0` to fake a green. The verified copy is left on disk (the workspace) so the
+# approval gate (Brick C) can promote it. XORICS-FEATURE: self-edit
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+_SELFEDIT_WORKSPACE = os.path.expanduser(
+    os.environ.get("XORICS_SELFEDIT_WORKSPACE", "~/.cache/xorics/selfedit"))
+_SELFEDIT_VERIFY_CMD = "./run_tests.sh"   # FIXED — the model never chooses how a write is verified.
+# Stage the live tree but KEEP .git (Brick C's promotion needs it) while dropping the
+# heavy / host-specific dirs. sandbox.run() then makes its OWN lean copy for the
+# container (its default ignore drops .git too), so the suite still runs fast.
+_SELFEDIT_STAGE_IGNORE = ("venv", "skidl-venv", ".venv", "__pycache__",
+                          ".mypy_cache", ".pytest_cache", "node_modules", "*.pyc")
+
+
+def _selfedit_image():
+    """The deps-baked sandbox image (env override, else the built tag)."""
+    return os.environ.get("XORICS_SANDBOX_IMAGE") or "localhost/xorics-sandbox:latest"
+
+
+def _selfedit_resolve(path):
+    """Resolve `path` (RELATIVE to the repo root) to (live_abs, ws_abs), refusing anything
+    absolute, ~-rooted, escaping the repo, or naming a directory. On refusal returns
+    (None, reason)."""
+    import os.path as _op
+    p = str(path).strip()
+    if not p or _op.isabs(p) or p.startswith("~"):
+        return None, ("write_file takes a path RELATIVE to the repo root (e.g. 'notebook.py' or "
+                      "'tools/foo.py') — absolute or ~ paths are refused.")
+    live_abs = _op.normpath(_op.join(REPO_ROOT, p))
+    if live_abs == REPO_ROOT or _op.commonpath([live_abs, REPO_ROOT]) != REPO_ROOT:
+        return None, f"refused: {p} resolves outside the repo. write_file only edits repo files."
+    if _op.isdir(live_abs):
+        return None, f"refused: {p} is a directory, not a file."
+    ws_abs = _op.normpath(_op.join(_SELFEDIT_WORKSPACE, "work", p))
+    return live_abs, ws_abs
+
+
+def _selfedit_stage():
+    """Ensure the workspace holds a COPY of the live repo. Idempotent within a session:
+    stages from the live tree only if the workspace is absent, so successive write_file
+    calls accumulate edits in the SAME copy. run_self_edit clears it per run."""
+    import shutil
+    ws = os.path.join(_SELFEDIT_WORKSPACE, "work")
+    if not os.path.isdir(ws):
+        os.makedirs(_SELFEDIT_WORKSPACE, exist_ok=True)
+        shutil.copytree(REPO_ROOT, ws,
+                        ignore=shutil.ignore_patterns(*_SELFEDIT_STAGE_IGNORE),
+                        symlinks=True)
+    return ws
+
+
+def _selfedit_reset():
+    """Drop any existing workspace (called at the start of a self-edit session)."""
+    import shutil
+    shutil.rmtree(_SELFEDIT_WORKSPACE, ignore_errors=True)
+
+
+def write_file(path: str, content: str) -> str:
+    """Write `content` to a repo file (path RELATIVE to the repo root, e.g. 'notebook.py'),
+    apply it to a COPY of the tree, run the full test suite in a throwaway container, and report
+    whether it PASSED. The live repo is NEVER touched. Success requires BOTH the suite to exit 0
+    inside the sandbox AND the file to actually differ from the live version — exit 0 alone, or a
+    no-op write, never counts. On success the verified copy is kept for approval. Use this to
+    propose an edit to Xorics's OWN code; read_file the target first to see the current contents.
+    XORICS-FEATURE: self-edit"""
+    from pathlib import Path as _P
+    live_abs, ws_abs = _selfedit_resolve(path)
+    if live_abs is None:
+        return ws_abs    # the refusal reason
+    rel = os.path.relpath(ws_abs, os.path.join(_SELFEDIT_WORKSPACE, "work"))
+
+    if sandbox.container_runtime() is None:
+        return ("write_file ERROR: no container runtime (podman/docker) on PATH — a write cannot be "
+                "verified safely, so it is refused. Start podman, then retry.")
+    try:
+        ws = _selfedit_stage()
+    except Exception as e:
+        return f"write_file ERROR: could not stage a workspace copy of the repo: {e}"
+
+    wp = _P(ws_abs)
+    try:
+        wp.parent.mkdir(parents=True, exist_ok=True)
+        wp.write_text(content, encoding="utf-8")
+    except Exception as e:
+        return f"write_file ERROR: could not write {rel} into the workspace: {e}"
+
+    # 'changed' is measured against the LIVE tree — the baseline the edit is proposed against.
+    lp = _P(live_abs)
+    if lp.exists() and lp.read_bytes() == wp.read_bytes():
+        return (f"NO CHANGE: {rel} is byte-identical to the live file — nothing to verify. If you "
+                "meant to change it, send the modified content.")
+    is_new = not lp.exists()
+
+    res = sandbox.run(ws, _SELFEDIT_VERIFY_CMD, artifacts=[rel],
+                      image=_selfedit_image(), network=False)
+    if res.error:
+        return f"write_file ERROR: the sandbox could not run the suite: {res.error}"
+    if res.ok:
+        verb = "created" if is_new else "edited"
+        return (f"WRITE VERIFIED: {rel} {verb} and the full suite PASSED inside the sandbox "
+                f"(exit 0, {res.elapsed:.0f}s). The live tree is untouched; the verified copy is staged "
+                f"at {ws}. It awaits the user's approval before being promoted to the live repo. You are "
+                "DONE — report what you changed; do not edit further.")
+    tail = (res.stdout or "")[-1400:]
+    estr = (res.stderr or "").strip()
+    return (f"WRITE REJECTED: {rel} was written but the suite FAILED inside the sandbox "
+            f"(exit {res.exit_code}). The live tree is untouched. Read the failing output below, fix the "
+            f"file, and call write_file again.\n--- suite output (tail) ---\n{tail}"
+            + (f"\n--- stderr (tail) ---\n{estr[-500:]}" if estr else ""))
+
+
 # ---- Tool declarations --------------------------------------------------------
 TOOLS = [
     {"type": "function", "function": {
@@ -386,6 +503,19 @@ TOOLS = [
             "paths": {"type": "array", "items": {"type": "string"},
                       "description": "Full paths of the files you are claiming as finished deliverables."}},
             "required": []}}},
+    {"type": "function", "function": {
+        "name": "write_file",
+        "description": "Propose an edit to Xorics's OWN source code. Writes the given content to a repo "
+                       "file (path RELATIVE to the repo root, e.g. 'notebook.py'), applies it to a COPY "
+                       "of the tree, runs the FULL test suite in a throwaway container, and reports "
+                       "WRITE VERIFIED only if the suite passes AND the file actually changed — the live "
+                       "tree is never touched. read_file the target first; send the WHOLE file with only "
+                       "your change applied. If REJECTED, fix the file and call again.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Path to the repo file to write, RELATIVE to the "
+                     "repo root (e.g. 'notebook.py' or 'tools/foo.py'). Absolute/~ paths are refused."},
+            "content": {"type": "string", "description": "The COMPLETE new contents of the file."}},
+            "required": ["path", "content"]}}},
 ]
 
 # Manager (gpt-oss) routes + delegates; it does NOT compile directly.
@@ -406,6 +536,13 @@ CODER_TOOLS = [t for t in TOOLS if t["function"]["name"]
 # convergence guard still drops the soft look-ups if it over-researches. XORICS-FEATURE: pcb-firmware-distinct
 FIRMWARE_TOOLS = [t for t in TOOLS if t["function"]["name"]
                   in ("compile_check", "search_datasheets", "fetch_datasheet", "web_search", "read_file")]
+
+# Self-edit toolset: the coder editing Xorics's OWN code. read_file to see a file, write_file to
+# propose a change (applied to a sandbox COPY, suite-verified, live tree untouched). Deliberately
+# NARROW — none of the PCB / firmware / build tools — so a self-edit delegation can only read and
+# propose-verified-write, nothing else (the firmware-gate pattern, applied to self-edit).
+# XORICS-FEATURE: self-edit
+SELF_EDIT_TOOLS = [t for t in TOOLS if t["function"]["name"] in ("read_file", "write_file")]
 
 # A turn that fires any of these attempted a design/build — used to scope the honesty-gate
 # footer so it never fires on plain chat. XORICS-FEATURE: honesty-gate
@@ -983,6 +1120,39 @@ def delegate_to_coder(task: str) -> str:
     return result
 
 
+# ---- self-edit sub-session (coder edits Xorics's own code; sandbox-verified) --
+_SELF_EDIT_GUIDE = (
+    "You are editing Xorics's OWN source code (a Python repo). Work in small, verified steps:\n"
+    "1. read_file the target file (path RELATIVE to the repo root, e.g. 'notebook.py') to see exactly "
+    "what is there now — never guess the current contents.\n"
+    "2. Make the SMALLEST change that satisfies the task. Preserve everything else byte-for-byte: "
+    "re-send the WHOLE file content to write_file with only your change applied.\n"
+    "3. write_file applies your version to a COPY of the repo and runs the FULL test suite in a "
+    "sandbox. It returns WRITE VERIFIED only if the suite passes AND the file actually changed. The "
+    "live code is never touched, and you do NOT get to choose how it is verified.\n"
+    "4. If it returns WRITE REJECTED, read the failing test output, fix the file, and write_file again "
+    "— iterate until the suite passes. If it returns WRITE VERIFIED, STOP and report what you changed; "
+    "the change then waits for the user's approval before it is promoted.\n"
+    "read_file and write_file are your ONLY tools by design — do not try to run shell commands, design "
+    "boards, or write firmware here.")
+
+
+def run_self_edit(task: str) -> str:
+    """Run the coder on a self-edit `task` with ONLY read_file + write_file. Each proposed write is
+    applied to a COPY of the repo and verified by the full suite in a sandbox; the live tree is never
+    mutated here (promotion is the approval gate, Brick C). Returns the coder's final report.
+    XORICS-FEATURE: self-edit"""
+    _selfedit_reset()                            # fresh copy of the live tree for this session
+    messages = [
+        {"role": "system",
+         "content": f"You are the {NAME} coding specialist ({CODER}). " + _SELF_EDIT_GUIDE},
+        {"role": "user", "content": task},
+    ]
+    final_text, messages, _built, _outcome = _agent_loop(
+        CODER, messages, SELF_EDIT_TOOLS, checkpoint=True, tag="selfedit")
+    return final_text
+
+
 TOOL_IMPLS = {
     "web_search": web_search,
     "see_image": see_image,
@@ -992,6 +1162,7 @@ TOOL_IMPLS = {
     "check_circuit": check_circuit,
     "check_circuit_file": check_circuit_file,
     "read_file": read_file,
+    "write_file": write_file,
     "find_part": find_part,
     "find_footprint": find_footprint,
     "part_pins": part_pins,
@@ -1180,7 +1351,7 @@ if __name__ == "__main__":
         sys.exit()
 
     print(f"{NAME} — local AI. The manager delegates coding to the coder automatically.")
-    print("commands: /code (coder)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
+    print("commands: /code (coder)  /selfedit (coder edits Xorics, sandbox-verified)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
     print(f"coder pauses every {CHECKPOINT_EVERY} steps to check in (no cap); backstop {CODER_BACKSTOP} when unattended.\n")
     if _CHAT_HISTORY:
         print(f"(resumed {len(_CHAT_HISTORY)} remembered messages — /reset to start fresh)\n")
@@ -1216,6 +1387,16 @@ if __name__ == "__main__":
                     continue
             elif q == "/reset" or q == "/new":
                 reset_history(); print("→ conversation cleared — fresh context\n")
+                continue
+            elif q == "/selfedit" or q.startswith("/selfedit "):   # XORICS-FEATURE: self-edit
+                task = q[9:].strip()
+                if not task:
+                    print("usage: /selfedit <what to change in Xorics's own code>\n")
+                    continue
+                print("→ self-edit mode (coder edits Xorics's own code; every write is sandbox-verified "
+                      "and the live tree is untouched until you approve)\n")
+                ans = run_self_edit(task)
+                print(f"\n{NAME.lower()}>", ans, "\n")
                 continue
             # manager/power turns carry the running transcript (persisted by _remember); coder turns
             # are task-scoped, no history. ask() is stateless now, so the REPL owns this. 
