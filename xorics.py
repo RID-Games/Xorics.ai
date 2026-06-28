@@ -232,11 +232,15 @@ def see_image(path: str, question: str = "Describe this image in detail.") -> st
 
 
 # ---- read a local text file (hand the coder a long prompt/spec by path) -------
-def read_file(path: str, max_chars: int = 20000) -> str:
-    """Read a local UTF-8 text file and return its contents, so a long prompt, spec, pin map, or
-    notes file can be handed to the coder by PATH instead of pasted. Output is capped so a huge
-    file can't blow the context window. For a saved SKiDL circuit you intend to VALIDATE, use
-    check_circuit_file instead. XORICS-FEATURE: read-file"""
+def read_file(path: str, max_chars: int = 200000) -> str:
+    """Read a local UTF-8 text file and return its contents, so a long prompt, spec, pin map,
+    notes file, or a whole SOURCE FILE can be handed to a model by PATH instead of pasted. Output
+    is capped at max_chars so a huge file can't blow the context window; the default is large enough
+    to hold this repo's own source files whole (needed for self-edit, which must see the ENTIRE file
+    to rewrite it). A small-context model can pass a smaller max_chars; a large-context model
+    rewriting a file should read it whole. If the result ends in a [truncated...] marker you do NOT
+    have the whole file -- re-read with a larger max_chars before editing it. For a saved SKiDL
+    circuit you intend to VALIDATE, use check_circuit_file instead. XORICS-FEATURE: read-file"""
     from pathlib import Path as _P
     fp = _P(path).expanduser()
     if not fp.exists():
@@ -614,7 +618,11 @@ TOOLS = [
                        "circuit you intend to validate, use check_circuit_file instead.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "Full path to a text file, e.g. "
-                     "~/xorics-ai/prompts/<name>.md."}},
+                     "~/xorics-ai/prompts/<name>.md."},
+            "max_chars": {"type": "integer", "description": "Max characters to return (default "
+                          "200000, enough to hold a whole source file). If the output ends in a "
+                          "[truncated...] marker the file is LARGER than this and you have only a "
+                          "prefix -- raise max_chars and re-read before editing it."}},
             "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "delegate_to_coder",
@@ -1267,7 +1275,12 @@ _SELF_EDIT_GUIDE = (
     "— iterate until the suite passes. If it returns WRITE VERIFIED, STOP and report what you changed; "
     "the change then waits for the user's approval before it is promoted.\n"
     "read_file and write_file are your ONLY tools by design — do not try to run shell commands, design "
-    "boards, or write firmware here.")
+    "boards, or write firmware here.\n"
+    "TRUNCATION — read this twice: read_file caps output at its max_chars. If what comes back ENDS IN a "
+    "'[truncated at N of M chars]' marker, you do NOT have the whole file — only the first N of M chars. "
+    "write_file expects the COMPLETE new contents, so writing a file you have only partially seen would "
+    "silently delete everything past N. NEVER do that. When you see that marker, re-read with a larger "
+    "max_chars (e.g. read_file(path, max_chars=400000)) until it is gone, and only then edit and write.")
 
 
 def run_self_edit(task: str, brain=None) -> str:
