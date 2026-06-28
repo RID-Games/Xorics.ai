@@ -912,6 +912,16 @@ def _record_skill_from_success(task: str, final_text: str, validator: str, path)
         print(f"    (skill not recorded — {type(e).__name__}: {e})")
 
 
+def _recall_for(task: str) -> str:
+    """Verified prior solutions for `task`, formatted for prompt injection ('' if none).
+    Best-effort: recall must NEVER break a delegation. XORICS-FEATURE: skill-recall"""
+    try:
+        skills.init()
+        return skills.format_for_prompt(skills.search_skills(task))
+    except Exception:
+        return ""
+
+
 # ---- The coder sub-session (runs on the coder brain, returns a saved file) -----
 def run_coder(task: str) -> str:
     """Run the coder brain on `task` until it produces verified code, save it, return summary+path.
@@ -933,6 +943,9 @@ def run_coder(task: str) -> str:
         messages[0]["content"] = ("You are the Xorics coding specialist (qwen3-coder), a firmware AND "
                                   "PCB co-pilot. " + _CODER_GUIDE)
         coder_tools = CODER_TOOLS
+    _recalled = _recall_for(task)                # XORICS-FEATURE: skill-recall — reuse prior verified solutions
+    if _recalled:
+        messages[0]["content"] += "\n\n" + _recalled
     final_text, messages, built_path, outcome = _agent_loop(CODER, messages, coder_tools, checkpoint=True, tag="coder")
 
     if final_text.startswith("(stopped"):
