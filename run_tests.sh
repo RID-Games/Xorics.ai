@@ -20,6 +20,7 @@ echo "dirty  : $(git status --porcelain 2>/dev/null | wc -l | tr -d ' ') uncommi
 echo
 echo "honesty gate  : finalize_design=$(grep -c 'def finalize_design' xorics.py) footer=$(grep -c '_append_manifest_footer' xorics.py)  (want 1 / 1)"
 echo "firmware gate : CompileResult=$(grep -c 'class CompileResult' firmware_tools.py)  (want 1)"
+echo "sandbox       : run=$(grep -c 'def run' sandbox.py 2>/dev/null) feature=$(grep -c 'XORICS-FEATURE: sandbox' sandbox.py 2>/dev/null)  (want >=1 / 1)"
 echo "grader flag   : $(grep -n 'FAIL_ON_NETLIST_ERRORS *=' pcb_tools.py | head -1)"
 echo
 
@@ -39,11 +40,19 @@ done
 echo
 echo "Suites: ${pass} passed, ${fail} failed"
 
+# Trustworthy exit code: a failed suite (or a failed --probe) makes this script
+# exit nonzero, so the sandbox runner's "success = exit 0" actually means it.
+# XORICS-FEATURE: sandbox
+rc_final=0
+[ "$fail" -gt 0 ] && rc_final=1
+
 if [ "${1:-}" = "--probe" ]; then
   echo
   bar; echo "LIVE PROBE (real models — minutes; needs llama-swap on :9090, in tmux)"; bar
   if ! command -v arduino-cli >/dev/null 2>&1; then
     echo "  [warn] arduino-cli missing — CHECK 3 (firmware accept-path) cannot compile."
   fi
-  "$PY" probe_honesty_gate.py --pass
+  "$PY" probe_honesty_gate.py --pass || rc_final=1
 fi
+
+exit "$rc_final"
