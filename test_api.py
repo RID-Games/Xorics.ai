@@ -18,11 +18,12 @@ def check(label, cond):
     if cond: _pass += 1; print(f"  ok   {label}")
     else:    _fail += 1; print(f"  FAIL {label}")
 
-# Stubbed model: record each call's history, return a deterministic reply + no built_path.
+# Stubbed model: record each call's history; return (reply, built_path=None, deliverables=[]) to
+# match _run_ask_full's 3-tuple contract.
 SEEN = []
 def fake_run_ask(text, history):
     SEEN.append({"text": text, "hist_len": len(history), "hist": list(history)})
-    return (f"reply#{len(SEEN)} to {text!r}", None)
+    return (f"reply#{len(SEEN)} to {text!r}", None, [])
 
 def no_auth(request):
     return None

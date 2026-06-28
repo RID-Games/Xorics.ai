@@ -171,10 +171,13 @@ RESEARCH_NUDGE_EVERY = 6    # if it keeps stalling, re-nudge every N further loo
 client = OpenAI(base_url="http://127.0.0.1:9090/v1", api_key="not-needed")
 # Vision specialist, reached directly (CPU, always on).
 vision_client = OpenAI(base_url="http://127.0.0.1:8081/v1", api_key="not-needed")
-# Remote frontier brain for /power (MiniMax M3). Key from the env — NEVER hardcoded; empty
-# string if unset, and /power refuses to switch without it. XORICS-FEATURE: power-mode
-minimax_client = OpenAI(base_url="https://api.minimax.io/v1",
-                        api_key=os.environ.get("MINIMAX_API_KEY", ""))
+# Remote frontier brain for /power (MiniMax M3). Key from the env — NEVER hardcoded. Built ONLY
+# when the key is present: the OpenAI client raises on an empty key, so an unset key must not crash
+# `import xorics`. /power refuses to switch without the key and client_for() only hands this out for
+# the MiniMax model, so the None below is never dereferenced. XORICS-FEATURE: power-mode
+minimax_client = (OpenAI(base_url="https://api.minimax.io/v1",
+                         api_key=os.environ["MINIMAX_API_KEY"])
+                  if os.environ.get("MINIMAX_API_KEY") else None)
 
 
 def client_for(model):

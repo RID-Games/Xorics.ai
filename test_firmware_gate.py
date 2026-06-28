@@ -99,7 +99,7 @@ def _resp_calling(name, arguments):
 
 def test_loop_built_stops_on_firmware_compile():
     calls = {"n": 0}
-    def fake_create(model, messages, tools):
+    def fake_create(model, messages, tools, **kwargs):  # absorb extra_body (reasoning_split) + future kwargs
         calls["n"] += 1
         return _resp_calling("compile_check", json.dumps({"code": "void setup(){}\nvoid loop(){}"}))
 

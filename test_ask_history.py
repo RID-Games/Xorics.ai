@@ -8,7 +8,14 @@
 # comes once the bridge wires this in — #lesson: a green unit test is necessary, not
 # sufficient.
 
+import os
 import sys
+
+# xorics.py builds /power's MiniMax client at module load from MINIMAX_API_KEY (xorics.py ~L176).
+# This unit test stubs the model loop and never calls that client, so a placeholder key just lets
+# `import xorics` succeed when the key is unset (the sibling tests stub `openai` to the same end).
+os.environ.setdefault("MINIMAX_API_KEY", "test-key-unused")
+os.environ.setdefault("OPENAI_API_KEY", "test-key-unused")
 
 try:
     import xorics
