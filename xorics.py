@@ -369,6 +369,139 @@ def write_file(path: str, content: str) -> str:
             + (f"\n--- stderr (tail) ---\n{estr[-500:]}" if estr else ""))
 
 
+# ---- self-edit: review + promote a verified change to the live repo (Brick C) -
+# The ONLY path that writes to the LIVE tree, and only behind explicit human approval —
+# there is deliberately NO tool for this, so the coder/manager can never self-promote.
+# After a WRITE VERIFIED the verified copy sits in the workspace; review_self_edit shows
+# exactly what differs from live, and promote_self_edit RE-VERIFIES it in the sandbox one
+# more time (never promote a stale green) before copying the changed files into the live
+# repo and committing them with an explicit `git add` (never -A). XORICS-FEATURE: self-edit
+_SELFEDIT_TASK_FILE = os.path.join(_SELFEDIT_WORKSPACE, "TASK.txt")
+
+
+def _selfedit_changed_files():
+    """Repo-relative paths whose workspace copy differs from the live tree (i.e. the write_file
+    edits). Skips .git entirely — the workspace's git is a stale copy and must NEVER be promoted —
+    and anything that resolves outside the repo. Returns [] if there is no workspace or no diff."""
+    ws = os.path.join(_SELFEDIT_WORKSPACE, "work")
+    if not os.path.isdir(ws):
+        return []
+    out = []
+    for root, dirs, files in os.walk(ws):
+        if ".git" in dirs:
+            dirs.remove(".git")              # never diff or promote git internals
+        for fn in files:
+            ab = os.path.join(root, fn)
+            rel = os.path.relpath(ab, ws)
+            live_abs, _ = _selfedit_resolve(rel)
+            if live_abs is None:             # outside the repo / unsafe — ignore
+                continue
+            try:
+                new = open(ab, "rb").read()
+            except OSError:
+                continue
+            if (not os.path.exists(live_abs)) or open(live_abs, "rb").read() != new:
+                out.append(rel)
+    return sorted(out)
+
+
+def _selfedit_diff(rels, max_lines=200):
+    """A unified diff (live vs workspace) for `rels`, truncated. Plain difflib — no git needed."""
+    import difflib
+    ws = os.path.join(_SELFEDIT_WORKSPACE, "work")
+    chunks = []
+    for rel in rels:
+        live_abs = os.path.join(REPO_ROOT, rel)
+        new_abs = os.path.join(ws, rel)
+        old = open(live_abs).read().splitlines(keepends=True) if os.path.exists(live_abs) else []
+        new = open(new_abs).read().splitlines(keepends=True)
+        chunks.append("".join(difflib.unified_diff(
+            old, new, fromfile=f"live/{rel}", tofile=f"verified/{rel}")))
+    text = "\n".join(c for c in chunks if c.strip())
+    lines = text.splitlines()
+    if len(lines) > max_lines:
+        text = "\n".join(lines[:max_lines]) + f"\n… ({len(lines) - max_lines} more diff lines)"
+    return text or "(no textual diff)"
+
+
+def review_self_edit():
+    """What's pending for promotion: (changed_files, diff_text, task). changed_files is [] if
+    nothing differs from the live tree."""
+    rels = _selfedit_changed_files()
+    task = ""
+    try:
+        task = open(_SELFEDIT_TASK_FILE).read().strip()
+    except OSError:
+        pass
+    return rels, (_selfedit_diff(rels) if rels else ""), task
+
+
+def promote_self_edit(message=None):
+    """Apply the verified change to the LIVE repo. The CALLER must have obtained approval first —
+    this is the only function that writes the live tree. It RE-VERIFIES the workspace in the sandbox
+    (the live tree is only ever written behind a CURRENT green, not an earlier one), then copies the
+    changed files into the live repo and `git add`s exactly those files (never -A) and commits.
+    Returns a status string. XORICS-FEATURE: self-edit"""
+    import shutil
+    import subprocess
+    rels = _selfedit_changed_files()
+    if not rels:
+        return "PROMOTE: nothing to promote — no verified change differs from the live tree."
+    if sandbox.container_runtime() is None:
+        return ("PROMOTE ERROR: no container runtime — cannot re-verify before touching the live "
+                "tree, so refusing. Start podman and retry.")
+    ws = os.path.join(_SELFEDIT_WORKSPACE, "work")
+
+    res = sandbox.run(ws, _SELFEDIT_VERIFY_CMD, image=_selfedit_image(), network=False)
+    if res.error:
+        return f"PROMOTE ERROR: re-verification could not run: {res.error}"
+    if not res.ok:
+        tail = (res.stdout or "")[-1000:]
+        return ("PROMOTE ABORTED: the verified copy no longer passes the suite (exit "
+                f"{res.exit_code}) — refusing to promote a stale change. The live tree is untouched."
+                f"\n--- suite output (tail) ---\n{tail}")
+
+    applied = []
+    for rel in rels:
+        live_abs, _ = _selfedit_resolve(rel)
+        if live_abs is None:                 # defensive: never write an unsafe path to live
+            return f"PROMOTE ERROR: refusing to write unsafe path {rel}."
+        os.makedirs(os.path.dirname(live_abs), exist_ok=True)
+        shutil.copy2(os.path.join(ws, rel), live_abs)
+        applied.append(rel)
+
+    task = ""
+    try:
+        task = open(_SELFEDIT_TASK_FILE).read().strip()
+    except OSError:
+        pass
+    msg = message or (f"xorics self-edit: {task}" if task else
+                      "xorics self-edit: " + ", ".join(applied))
+    add = subprocess.run(["git", "-C", REPO_ROOT, "add", "--"] + applied,
+                         capture_output=True, text=True)
+    if add.returncode != 0:
+        return (f"PROMOTE: files copied into the live tree but `git add` failed: {add.stderr.strip()}. "
+                "The change is on disk; commit it manually.")
+    commit = subprocess.run(["git", "-C", REPO_ROOT, "commit", "-m", msg],
+                            capture_output=True, text=True)
+    if commit.returncode != 0:
+        return (f"PROMOTE: files staged in the live tree but `git commit` failed: "
+                f"{(commit.stderr or commit.stdout).strip()}. Commit manually.")
+    head = subprocess.run(["git", "-C", REPO_ROOT, "rev-parse", "--short", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+    _selfedit_reset()                        # promoted — clear the workspace
+    return (f"PROMOTED — applied to the live repo and committed ({head or 'HEAD'}): "
+            + ", ".join(applied) + ". Re-verified green in the sandbox before writing.")
+
+
+def discard_self_edit():
+    """Throw away the pending verified change without touching the live tree."""
+    had = bool(_selfedit_changed_files())
+    _selfedit_reset()
+    return ("DISCARDED — the pending self-edit was thrown away; the live tree was untouched."
+            if had else "Nothing pending to discard.")
+
+
 # ---- Tool declarations --------------------------------------------------------
 TOOLS = [
     {"type": "function", "function": {
@@ -1143,6 +1276,11 @@ def run_self_edit(task: str) -> str:
     mutated here (promotion is the approval gate, Brick C). Returns the coder's final report.
     XORICS-FEATURE: self-edit"""
     _selfedit_reset()                            # fresh copy of the live tree for this session
+    os.makedirs(_SELFEDIT_WORKSPACE, exist_ok=True)
+    try:
+        open(_SELFEDIT_TASK_FILE, "w").write(task or "")   # for the promote commit message
+    except OSError:
+        pass
     messages = [
         {"role": "system",
          "content": f"You are the {NAME} coding specialist ({CODER}). " + _SELF_EDIT_GUIDE},
@@ -1150,6 +1288,10 @@ def run_self_edit(task: str) -> str:
     ]
     final_text, messages, _built, _outcome = _agent_loop(
         CODER, messages, SELF_EDIT_TOOLS, checkpoint=True, tag="selfedit")
+    pending = _selfedit_changed_files()          # XORICS-FEATURE: self-edit (approval gate)
+    if pending:
+        final_text += ("\n\n[Verified change staged: " + ", ".join(pending) + ". Review and apply "
+                       "it to the live repo with /promote, or throw it away with /discard.]")
     return final_text
 
 
@@ -1351,7 +1493,7 @@ if __name__ == "__main__":
         sys.exit()
 
     print(f"{NAME} — local AI. The manager delegates coding to the coder automatically.")
-    print("commands: /code (coder)  /selfedit (coder edits Xorics, sandbox-verified)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
+    print("commands: /code (coder)  /selfedit (coder edits Xorics, sandbox-verified)  /promote /discard (approve or drop a self-edit)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
     print(f"coder pauses every {CHECKPOINT_EVERY} steps to check in (no cap); backstop {CODER_BACKSTOP} when unattended.\n")
     if _CHAT_HISTORY:
         print(f"(resumed {len(_CHAT_HISTORY)} remembered messages — /reset to start fresh)\n")
@@ -1397,6 +1539,25 @@ if __name__ == "__main__":
                       "and the live tree is untouched until you approve)\n")
                 ans = run_self_edit(task)
                 print(f"\n{NAME.lower()}>", ans, "\n")
+                continue
+            elif q == "/promote" or q.startswith("/promote "):   # XORICS-FEATURE: self-edit (approval gate)
+                msg = q[8:].strip() or None
+                rels, diff, task = review_self_edit()
+                if not rels:
+                    print("nothing pending to promote.\n")
+                    continue
+                print("Pending self-edit" + (f" for: {task}" if task else "")
+                      + "\nchanged: " + ", ".join(rels) + "\n")
+                print(diff + "\n")
+                ok = input("Re-verify in the sandbox and APPLY to the live repo? [y/N] ").strip().lower()
+                if ok != "y":
+                    print("not promoted (left staged; /discard to drop it).\n")
+                    continue
+                print("re-verifying before applying…")
+                print(promote_self_edit(msg) + "\n")
+                continue
+            elif q == "/discard":                                # XORICS-FEATURE: self-edit
+                print(discard_self_edit() + "\n")
                 continue
             # manager/power turns carry the running transcript (persisted by _remember); coder turns
             # are task-scoped, no history. ask() is stateless now, so the REPL owns this. 
