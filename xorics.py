@@ -57,6 +57,7 @@ from web_datasheets import fetch_datasheet          # web -> index a datasheet P
 from firmware_tools import compile_check, save_sketch
 from notebook import Notebook                                              # XORICS-FEATURE: coder-notebook
 from pcb_tools import check_circuit, check_circuit_file, find_part, find_footprint, part_pins, save_circuit   # SKiDL: search + run ERC
+import skills                                       # XORICS-FEATURE: skill-write-on-success
 
 
 class _ToolResult(str):
@@ -870,6 +871,47 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
     return final_text, messages, built_path, {"built": built_happened, "design_attempt": design_attempt}
 
 
+# ---- Skill memory: distil a reusable how-to from a VERIFIED success ------------
+def _skill_title(task: str) -> str:
+    """A short, recall-friendly title from the task's first line."""
+    t = (task or "").strip()
+    line = t.splitlines()[0] if t else "skill"
+    line = re.sub(r"\s+", " ", line).strip()
+    return line[:70].rstrip() or "skill"
+
+
+def _record_skill_from_success(task: str, final_text: str, validator: str, path) -> None:
+    """After a VERIFIED build, write a reusable skill from the working result.
+
+    The honesty gate lives inside skills.save_skill (validator required; a given source
+    path must exist), so this only ever persists skills backed by a real, validated
+    artifact — the same guarantee as the deliverables ledger, one step further. It is
+    wrapped so a skill-write failure can NEVER break run_coder's success return.
+
+    Draft-then-fix: the body is the coder's own verified result (working code + framing)
+    that is already in hand; tighter LLM re-distillation is a later refinement. A repeat
+    of the same task (same title+domain) bumps the use counter instead of piling up
+    near-identical skills. XORICS-FEATURE: skill-write-on-success
+    """
+    try:
+        skills.init()                               # idempotent; ensures the table exists at runtime
+        title = _skill_title(task)
+        domain = "firmware" if str(path).endswith(".ino") else "pcb"
+        for s in skills.list_skills(domain):        # dedup: don't re-store the same solved task
+            if s["title"] == title:
+                skills.mark_used(s["id"])
+                return
+        body = (f"Verified working solution (passed {validator}). Reuse this approach/code:\n\n"
+                f"{final_text}")
+        skills.save_skill(title, trigger=(task or "")[:200], body=body, validator=validator,
+                          domain=domain, source_path=str(path))
+        print(f"    \u270e skill recorded: {title}")
+    except skills.UnverifiedSkill as e:
+        print(f"    (skill not recorded — honesty gate: {e})")
+    except Exception as e:                           # never let skill-writing break a real success
+        print(f"    (skill not recorded — {type(e).__name__}: {e})")
+
+
 # ---- The coder sub-session (runs on the coder brain, returns a saved file) -----
 def run_coder(task: str) -> str:
     """Run the coder brain on `task` until it produces verified code, save it, return summary+path.
@@ -905,10 +947,13 @@ def run_coder(task: str) -> str:
         # BUILT came from check_circuit_file — the script is already saved at built_path.
         # Report it; re-saving here would just re-slug the task into a junk directory.
         _record_deliverable(built_path, "check_circuit_file")   # honesty-gate: verified to disk
+        _record_skill_from_success(task, final_text, "check_circuit_file", built_path)  # XORICS-FEATURE: skill-write-on-success
         return f"{final_text}\n\n[Xorics verified the saved deliverable at: {built_path}]"
     path = _save_deliverable(final_text, task)
     if path and outcome["built"]:               # honesty-gate: only record a file a validator passed
-        _record_deliverable(path, "compile_check" if str(path).endswith(".ino") else "check_circuit")
+        _validator = "compile_check" if str(path).endswith(".ino") else "check_circuit"
+        _record_deliverable(path, _validator)
+        _record_skill_from_success(task, final_text, _validator, path)  # XORICS-FEATURE: skill-write-on-success
     if path:
         return f"{final_text}\n\n[Xorics saved the verified deliverable to: {path}]"
     return final_text + "\n\n[No code block found to save as a file.]"
