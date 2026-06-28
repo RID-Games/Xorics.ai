@@ -58,6 +58,7 @@ from firmware_tools import compile_check, save_sketch
 from notebook import Notebook                                              # XORICS-FEATURE: coder-notebook
 from pcb_tools import check_circuit, check_circuit_file, find_part, find_footprint, part_pins, save_circuit   # SKiDL: search + run ERC
 import skills                                       # XORICS-FEATURE: skill-write-on-success
+import capabilities
 import sandbox                                       # XORICS-FEATURE: self-edit (throwaway-container verify)
 
 
@@ -1476,7 +1477,7 @@ def ask(user_message: str, history=None) -> str:
     if is_coder:
         system = f"You are {NAME}, the coding specialist, in manual coding mode. " + _CODER_GUIDE
     else:
-        system = _MANAGER_PERSONA + "\n\n" + _MANAGER_ROUTING
+        system = _MANAGER_PERSONA + "\n\n" + capabilities.self_knowledge() + "\n\n" + _MANAGER_ROUTING
     messages = [{"role": "system", "content": system}]
     if history:                                  # prior turns: spliced between system and the new turn
         messages.extend(history)
