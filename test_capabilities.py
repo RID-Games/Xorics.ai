@@ -51,10 +51,6 @@ def _line(text, domain):
     return ""
 
 
-# Build a {domain: label} map so we can locate each capability's line.
-capabilities.CAPABILITIES_BY_DOMAIN = {c["domain"]: c["label"] for c in capabilities.CAPABILITIES}
-
-
 # --- Tests ------------------------------------------------------------------
 
 # 1) With every count 0, self_knowledge() is a non-empty string carrying all

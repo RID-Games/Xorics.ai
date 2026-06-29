@@ -44,6 +44,9 @@ CAPABILITIES = [
 ]
 
 
+CAPABILITIES_BY_DOMAIN = {c["domain"]: c["label"] for c in CAPABILITIES}
+
+
 def _verified_count(domain):
     """Live count of skills on file for `domain` — the evidence behind a claim.
 
