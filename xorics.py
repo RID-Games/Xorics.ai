@@ -1363,7 +1363,7 @@ def _design_files_read(messages):
 
 
 def _design_spec_targets(spec_text):
-    """The set of repo .py basenames that appear in `spec_text` (via r'[\w./-]+\.py'),
+    r"""The set of repo .py basenames that appear in `spec_text` (via r'[\w./-]+\.py'),
     intersected with the .py files actually present in this file's own directory — so
     the gate only fires on real, editable targets, not on 'setup.py' or 'urllib.py' the
     spec mentioned in passing. Empty set if the spec names no in-repo .py."""
@@ -1376,7 +1376,7 @@ def _design_spec_targets(spec_text):
         here = set(os.listdir(os.path.dirname(os.path.abspath(__file__))))
     except OSError:
         return set()
-    return {n for n in names if n in here}
+    return {os.path.basename(n) for n in names if os.path.basename(n) in here}
 
 
 def _gate_design_spec(final_text, messages):
@@ -1406,6 +1406,24 @@ def _gate_design_spec(final_text, messages):
         "the spec is ungrounded, so it was removed."
 
 
+def _selfedit_incomplete(task, pending):
+    """Repo .py target(s) NAMED in `task` that are NOT among the staged `pending` files
+    (basename-compared) — files the self-edit was asked to change but silently left out.
+    Mirrors the design read-gate mechanically: a self-edit that names two files but writes
+    one has DROPPED the other, so this surfaces it instead of letting it report a clean
+    success. Returns [] when NOTHING was staged (that no-op is already visible — there is no
+    'change staged' line to mistake for success) or when the task names no in-repo .py
+    (completeness can't be judged, so no flag). Reuses _design_spec_targets to resolve the
+    named repo files. XORICS-FEATURE: self-edit"""
+    if not pending:
+        return []
+    named = _design_spec_targets(task)
+    if not named:
+        return []
+    wrote = {os.path.basename(p) for p in pending}
+    return sorted(named - wrote)
+
+
 def run_self_edit(task: str, brain=None) -> str:
     """Run a self-edit `task` with ONLY read_file + write_file, on `brain` (default the local coder;
     pass MINIMAX to drive big-file edits on the remote frontier brain — the local coder's 8K context
@@ -1430,6 +1448,14 @@ def run_self_edit(task: str, brain=None) -> str:
     if pending:
         final_text += ("\n\n[Verified change staged: " + ", ".join(pending) + ". Review and apply "
                        "it to the live repo with /promote, or throw it away with /discard.]")
+    dropped = _selfedit_incomplete(task, pending)   # XORICS-FEATURE: self-edit (completeness gate)
+    if dropped:
+        final_text += ("\n\n=== INCOMPLETE EDIT (named target not written) ===\n"
+                       "The task named " + ", ".join(dropped) + " as an edit target, but only "
+                       + ", ".join(pending) + " was written — the file(s) named above were not "
+                       "changed. If they were meant to change, this edit is INCOMPLETE: do NOT "
+                       "/promote it as a finished change. Re-run /selfedit for each dropped file "
+                       "(one file per task), then /promote, or /discard.")
     return final_text
 
 

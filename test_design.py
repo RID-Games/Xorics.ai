@@ -125,5 +125,78 @@ finally:
     xorics._agent_loop = _saved_agent_loop
 
 
+# --- Group 4: _design_spec_targets basenames path-qualified names (one-liner #1) -
+# A spec may name a file as `xorics-ai/capabilities.py` or `./capabilities.py`; the
+# target resolver must reduce those to the repo basename so the gate can match them
+# against what was read. Pre-fix it compared the full token to os.listdir() and so a
+# path-qualified name silently resolved to {} (no target), letting an ungrounded spec
+# pass the >=1-read floor.
+_st = xorics._design_spec_targets
+check("(4) bare 'capabilities.py' resolves to {capabilities.py}",
+      _st("capabilities.py") == {"capabilities.py"})
+check("(4) path-qualified 'xorics-ai/capabilities.py' resolves to basename",
+      _st("xorics-ai/capabilities.py") == {"capabilities.py"})
+check("(4) unknown .py dropped, real repo .py kept",
+      _st("touch nonexistent_module.py and capabilities.py") == {"capabilities.py"})
+
+# Gate-level regression: a path-qualified target that was NEVER read must BLOCK. This
+# is the bug one-liner #1 fixes — pre-fix `named` was empty for the path-qualified
+# token, so reading any unrelated file (skills.py) satisfied the floor and the spec
+# slipped through. Post-fix the basename matches, `missing` is non-empty, gate blocks.
+xorics._agent_loop = _stub_agent_loop_gate
+try:
+    _g_text[0] = ("PLAN: touch capabilities.py.\n" + _MARK
+                  + "\nIn xorics-ai/capabilities.py, add the new binding.")
+    _g_msgs[0] = [_amsg("skills.py")]
+    out = xorics.run_design("g")
+    check("(4) path-qualified spec BLOCKED when only an unrelated file was read",
+          "SELF-EDIT SPEC BLOCKED" in out and _MARK not in out)
+
+    _g_msgs[0] = [_amsg("/home/zawayix/xorics-ai/capabilities.py")]
+    out = xorics.run_design("g")
+    check("(4) same spec kept once the real target was read (basename match)",
+          _MARK in out and "BLOCKED" not in out)
+finally:
+    xorics._agent_loop = _saved_agent_loop
+
+
+# --- Group 5: _selfedit_incomplete flags named-but-unwritten targets (primary fix) -
+# The canonical bug: a 2-file self-edit writes one file and reports clean success,
+# silently dropping the other. The completeness gate names any in-repo .py target that
+# was asked for but not staged. Guards: empty `pending` is a no-op (already visible, no
+# flag); a task naming no repo .py can't be judged (no flag); basenames are compared so
+# path-qualified names and ./-prefixed staged paths line up.
+_si = xorics._selfedit_incomplete
+check("(5) 2-file task, only 1 written -> the dropped file is flagged",
+      _si("edit xorics.py and add a group to test_design.py", ["xorics.py"])
+      == ["test_design.py"])
+check("(5) 2-file task, both written -> nothing flagged",
+      _si("edit xorics.py and add a group to test_design.py",
+          ["xorics.py", "test_design.py"]) == [])
+check("(5) 1-file task, that file written -> nothing flagged",
+      _si("edit only xorics.py", ["xorics.py"]) == [])
+check("(5) path-qualified named target, different file written -> basename flagged",
+      _si("edit xorics-ai/capabilities.py", ["xorics.py"]) == ["capabilities.py"])
+check("(5) nothing staged -> no flag (a total no-op is already visible)",
+      _si("add a docstring to capabilities.py", []) == [])
+check("(5) task names no repo .py -> no flag (completeness can't be judged)",
+      _si("fix the typo in the startup banner", ["xorics.py"]) == [])
+check("(5) staged path with ./ prefix is basename-compared, not flagged",
+      _si("edit xorics.py", ["./xorics.py"]) == [])
+
+
+# --- Group 6: xorics.py compiles with zero SyntaxWarning (one-liner #2) ----------
+# The planning-guide docstring contained a bare regex `\w` in a non-raw string, which
+# emits a SyntaxWarning at compile time on 3.12+. Raw-stringing it silences that. Force
+# "always" so the warnings registry can't suppress a repeat, and assert none are raised.
+import warnings as _warnings
+_src = open(xorics.__file__).read()
+with _warnings.catch_warnings(record=True) as _w:
+    _warnings.simplefilter("always")
+    compile(_src, xorics.__file__, "exec")
+_syntaxwarns = [x for x in _w if issubclass(x.category, SyntaxWarning)]
+check("(6) xorics.py compiles with zero SyntaxWarning", len(_syntaxwarns) == 0)
+
+
 print(f"\n{PASS}/{PASS + FAIL} checks passed")
 sys.exit(0 if FAIL == 0 else 1)
