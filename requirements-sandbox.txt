@@ -1,0 +1,25 @@
+# Xorics sandbox image deps — the third-party surface the hermetic suite imports.
+#
+# VERIFIED, not guessed: these exact versions run ALL 18 hermetic suites green on
+# python 3.12 (./run_tests.sh -> "Suites: 18 passed, 0 failed", exit 0). Derived by
+# installing into a clean venv and letting real ImportErrors dictate the list:
+#   - import xorics  -> openai + numpy + PyMuPDF + ddgs  (via datasheet_rag / web_datasheets)
+#   - import api     -> fastapi  (-> starlette + pydantic, pulled transitively)
+#   - httpx is NOT listed: it arrives transitively (openai / ddgs) and is only used lazily.
+#
+# Deliberately ABSENT (proven unnecessary for the hermetic suite):
+#   - skidl / KiCad : pcb_tools shells SKiDL out to skidl-venv via subprocess strings,
+#                     so importing pcb_tools needs no skidl. The PCB unit suites
+#                     (validate_circuit, find_footprint, footprint_check, usb_cc_check)
+#                     all pass with skidl absent.
+#   - arduino-cli   : firmware compile is a LIVE-probe concern, never hermetic.
+#   - pypdf, python-docx : not imported at load time by anything the suite touches.
+#
+# If RIDGames' host venv drifts materially from these versions and a suite ever
+# behaves differently host-vs-sandbox, regenerate from the host:
+#   venv/bin/pip freeze | grep -iE '^(openai|numpy|pymupdf|ddgs|fastapi)=='
+openai==2.44.0
+numpy==2.5.0
+PyMuPDF==1.27.2.3
+ddgs==9.14.4
+fastapi==0.138.1

@@ -112,3 +112,6 @@ Thumbs.db
 
 # Local state DB + uploaded file bytes (store.py)
 data/
+
+# Upstream Hermes runtime (integrated against, not vendored)
+hermes-runtime/
