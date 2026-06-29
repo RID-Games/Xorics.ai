@@ -686,6 +686,14 @@ FIRMWARE_TOOLS = [t for t in TOOLS if t["function"]["name"]
 # XORICS-FEATURE: self-edit
 SELF_EDIT_TOOLS = [t for t in TOOLS if t["function"]["name"] in ("read_file", "write_file")]
 
+# Planning-only toolset: the planner proposing what an Xorics change should look like, BEFORE
+# any /selfedit run. read_file only — no write_file, no sandbox, no build tools. The planner
+# reads source file(s) in full, reasons about the smallest change that meets the goal, and
+# emits (a) a PLAN and (b) a single-line self-edit spec the user can paste into /selfedit.
+# Mirrors the self-edit plumbing but READ-ONLY: it must never write, edit, or run anything.
+# XORICS-FEATURE: design-mode
+PLAN_TOOLS = [t for t in TOOLS if t["function"]["name"] == "read_file"]
+
 # A turn that fires any of these attempted a design/build — used to scope the honesty-gate
 # footer so it never fires on plain chat. XORICS-FEATURE: honesty-gate
 _DESIGN_TOOLS = {"delegate_to_coder", "check_circuit", "check_circuit_file", "validate_circuit", "compile_check"}
@@ -1284,6 +1292,42 @@ _SELF_EDIT_GUIDE = (
     "max_chars (e.g. read_file(path, max_chars=400000)) until it is gone, and only then edit and write.")
 
 
+# ---- design mode: planner proposes an Xorics change (READ-ONLY) ---------------
+# Mirrors the self-edit plumbing — same brain plumbing, same prompt shape — but uses
+# PLAN_TOOLS (read_file only) and a planning-only guide. The planner reads source files
+# in full, decides the SMALLEST change that meets the goal, and prints (a) a PLAN the
+# user can read and (b) a single-line self-edit spec under "=== SELF-EDIT SPEC ==="
+# that the user can paste straight into /selfedit. It must NEVER write_file, run a
+# command, start the sandbox, or begin editing — planning only. Nothing is staged
+# (no _selfedit_reset, no _selfedit_changed_files, no write). XORICS-FEATURE: design-mode
+_DESIGN_GUIDE = (
+    "You are the Xorics CHANGE PLANNER — you propose what an edit to Xorics's OWN source code "
+    "should look like, BEFORE any /selfedit run. You are STRICTLY READ-ONLY.\n"
+    "Your ONLY tool is read_file. You must NOT write_file. You must NOT run shell commands, build a "
+    "board, design firmware, start the sandbox, or call any other tool — you plan, then you stop.\n"
+    "Workflow:\n"
+    "1. Identify the relevant source file(s) in this repo (xorics.py is the main one; look at others "
+    "only if the goal clearly points at them).\n"
+    "2. read_file them IN FULL. TRUNCATION RULE — same as the self-edit guide: read_file caps output "
+    "at its max_chars. If what comes back ENDS IN a '[truncated at N of M chars]' marker, you do NOT "
+    "have the whole file — only the first N of M chars. Re-read with a larger max_chars "
+    "(e.g. read_file(path, max_chars=400000)) until the marker is gone. Plan against a truncated file "
+    "and you will propose a change that silently breaks everything past N. NEVER do that.\n"
+    "3. Reason about the SMALLEST change that meets the goal — what file and function it touches, "
+    "what the new behaviour is, and how it would be verified (e.g. the repo's existing test suite "
+    "must still pass in the sandbox). Prefer a single, localised edit over a refactor.\n"
+    "Output format — both sections, in this order:\n"
+    "  PLAN: <short paragraph: the goal, the file/function touched, the smallest change that meets "
+    "the goal, and how it would be verified (e.g. via the existing self-edit suite / run_tests.sh).>\n"
+    "  === SELF-EDIT SPEC ===\n"
+    "  <ONE single line the user can paste straight into /selfedit: a complete, self-contained "
+    "task description that, when fed to run_self_edit, will produce exactly the change you "
+    "planned. One line — no leading bullet, no trailing commentary.>\n"
+    "After you print both sections, you are DONE. STOPS after printing the plan for the user to "
+    "approve and does NOT begin editing. Do not call any more tools. Do not propose follow-up "
+    "changes. The user decides whether to run /selfedit with the spec.")
+
+
 def run_self_edit(task: str, brain=None) -> str:
     """Run a self-edit `task` with ONLY read_file + write_file, on `brain` (default the local coder;
     pass MINIMAX to drive big-file edits on the remote frontier brain — the local coder's 8K context
@@ -1308,6 +1352,25 @@ def run_self_edit(task: str, brain=None) -> str:
     if pending:
         final_text += ("\n\n[Verified change staged: " + ", ".join(pending) + ". Review and apply "
                        "it to the live repo with /promote, or throw it away with /discard.]")
+    return final_text
+
+
+def run_design(goal: str, brain=None) -> str:
+    """Planning-only: produce a PLAN + a one-line self-edit spec for `goal`, on `brain`
+    (default the active BRAIN — the local manager, or MiniMax M3 in power mode). Mirrors
+    run_self_edit's shape but uses PLAN_TOOLS (read_file only) and the planning guide.
+    No writes, no sandbox, no /promote staging, no _selfedit_reset, no _selfedit_changed_files —
+    nothing is staged; the live tree and the self-edit workspace are both untouched. The planner
+    prints its plan and stops; the user decides whether to run /selfedit with the spec.
+    XORICS-FEATURE: design-mode"""
+    brain = brain or BRAIN
+    messages = [
+        {"role": "system",
+         "content": f"You are the {NAME} change-planner ({brain}). " + _DESIGN_GUIDE},
+        {"role": "user", "content": goal},
+    ]
+    final_text, _messages, _built, _outcome = _agent_loop(
+        brain, messages, PLAN_TOOLS, checkpoint=False, tag="design")
     return final_text
 
 
@@ -1509,7 +1572,7 @@ if __name__ == "__main__":
         sys.exit()
 
     print(f"{NAME} — local AI. The manager delegates coding to the coder automatically.")
-    print("commands: /code (coder)  /selfedit (edit Xorics, sandbox-verified; /power first → drive on M3)  /promote /discard (approve or drop a self-edit)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
+    print("commands: /code (coder)  /selfedit (edit Xorics, sandbox-verified; /power first → drive on M3)  /design (plan an Xorics change, read-only — no writes)  /promote /discard (approve or drop a self-edit)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
     print(f"coder pauses every {CHECKPOINT_EVERY} steps to check in (no cap); backstop {CODER_BACKSTOP} when unattended.\n")
     if _CHAT_HISTORY:
         print(f"(resumed {len(_CHAT_HISTORY)} remembered messages — /reset to start fresh)\n")
@@ -1557,6 +1620,20 @@ if __name__ == "__main__":
                 print(f"→ self-edit mode (driver: {where}; every write is sandbox-verified, the live "
                       "tree untouched until you approve)\n")
                 ans = run_self_edit(task, brain=driver)
+                print(f"\n{NAME.lower()}>", ans, "\n")
+                continue
+            elif q == "/design" or q.startswith("/design "):   # XORICS-FEATURE: design-mode
+                goal = q[7:].strip()
+                if not goal:
+                    print("usage: /design <what to plan in Xorics's own code>  "
+                          "(read-only: prints a PLAN + one-line self-edit spec, makes no edits; "
+                          "run /power first to plan on MiniMax M3)\n")
+                    continue
+                driver = MINIMAX if BRAIN == MINIMAX else MANAGER   # planning brain, not the coder
+                where = "MiniMax M3, remote" if driver == MINIMAX else f"{driver}, local"
+                print(f"→ design mode (planner: {where}; planning only — reads source files and "
+                      "prints a PLAN + self-edit spec, makes NO edits and stops)\n")
+                ans = run_design(goal, brain=driver)
                 print(f"\n{NAME.lower()}>", ans, "\n")
                 continue
             elif q == "/promote" or q.startswith("/promote "):   # XORICS-FEATURE: self-edit (approval gate)
