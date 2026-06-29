@@ -78,5 +78,52 @@ finally:
     xorics._selfedit_changed_files = _saved_selfedit_changed_files
 
 
+# --- Group 3: read-gate — no self-edit spec unless the target was read --------
+_MARK = xorics._DESIGN_SPEC_MARKER
+
+
+def _amsg(path):
+    """An assistant turn that recorded a read_file call on `path` (the shape _agent_loop logs)."""
+    return {"role": "assistant", "content": "",
+            "tool_calls": [{"id": "x", "type": "function",
+                            "function": {"name": "read_file",
+                                         "arguments": '{"path": "%s"}' % path}}]}
+
+
+_g_text = [""]      # what the stubbed planner "returns" as its final text
+_g_msgs = [[]]      # the transcript the stubbed planner produced
+
+
+def _stub_agent_loop_gate(model, messages, tools, *, checkpoint, tag):
+    return (_g_text[0], _g_msgs[0], None, None)
+
+
+xorics._agent_loop = _stub_agent_loop_gate
+try:
+    _plan = "PLAN: add the CAPABILITIES_BY_DOMAIN binding to capabilities.py.\n"
+    _spec = _MARK + "\nIn capabilities.py, add the CAPABILITIES_BY_DOMAIN binding."
+    _g_text[0] = _plan + _spec
+
+    _g_msgs[0] = [_amsg("/home/zawayix/xorics-ai/capabilities.py")]
+    out = xorics.run_design("g")
+    check("(3) spec kept when named target (capabilities.py) was read", _MARK in out and "BLOCKED" not in out)
+
+    _g_msgs[0] = []
+    out = xorics.run_design("g")
+    check("(3) spec blocked + plan kept when nothing was read",
+          "SELF-EDIT SPEC BLOCKED" in out and _MARK not in out and out.startswith("PLAN:"))
+
+    _g_msgs[0] = [_amsg("skills.py")]
+    out = xorics.run_design("g")
+    check("(3) spec blocked when only a non-target file was read", "BLOCKED" in out and _MARK not in out)
+
+    _g_text[0] = "PLAN: reword the planner guide.\n" + _MARK + "\nTighten the planner guide wording."
+    _g_msgs[0] = [_amsg("xorics.py")]
+    out = xorics.run_design("g")
+    check("(3) spec kept when it names no repo file and a read happened", _MARK in out and "BLOCKED" not in out)
+finally:
+    xorics._agent_loop = _saved_agent_loop
+
+
 print(f"\n{PASS}/{PASS + FAIL} checks passed")
 sys.exit(0 if FAIL == 0 else 1)
