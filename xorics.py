@@ -259,8 +259,8 @@ def read_file(path: str, max_chars: int = 200000) -> str:
 
 
 # ---- self-edit: write a repo file into a sandbox COPY and verify it -----------
-# Brick B of the self-edit keystone. The coder proposes a file write; we apply it to
-# a COPY of the repo (the live tree is NEVER touched), run the FULL suite in a
+# Brick B of the self-edit keystone. The coder proposes a file write; we apply it to a
+# COPY of the repo (the live tree is NEVER touched), run the FULL suite in a
 # throwaway container (sandbox.run -> the honesty gate, generalized), and report
 # success ONLY if the suite exits 0 AND the file actually differs from the live
 # version. The verify command is NOT model-controlled, so a weak coder cannot pass
@@ -622,8 +622,8 @@ TOOLS = [
                      "~/xorics-ai/prompts/<name>.md."},
             "max_chars": {"type": "integer", "description": "Max characters to return (default "
                           "200000, enough to hold a whole source file). If the output ends in a "
-                          "[truncated...] marker the file is LARGER than this and you have only a "
-                          "prefix -- raise max_chars and re-read before editing it."}},
+                          "[truncated...] marker you do NOT have the whole file -- raise max_chars "
+                          "and re-read before editing it."}},
             "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "delegate_to_coder",
@@ -1328,6 +1328,84 @@ _DESIGN_GUIDE = (
     "changes. The user decides whether to run /selfedit with the spec.")
 
 
+# Mechanical read-gate for design mode: run_design cannot emit a self-edit spec unless
+# read_file actually fired on the file(s) that spec targets. The plan/sandbox tools are
+# read-only, but a planner can still SKIP reading and hallucinate a spec for any file —
+# and the user has no way to tell a grounded spec from a guess. So we make the read
+# mechanical: a spec that names any .py in the repo must be backed by a real read_file
+# call on that file in the transcript. The gate splits the final text on the marker,
+# resolves the .py basenames the spec mentions to the actual files in this repo, and
+# compares against the set of files the planner read. A spec that names nothing is
+# likewise blocked unless at least one read happened — so a planner that just prints a
+# spec without reading anything is caught too. XORICS-FEATURE: design-mode
+_DESIGN_SPEC_MARKER = "=== SELF-EDIT SPEC ==="
+
+
+def _design_files_read(messages):
+    """The set of file basenames the planner actually read_file'd across the assistant
+    messages. Used to ground a self-edit spec — a spec that names a file but the planner
+    never read it is a fabrication, and is BLOCKED by the gate."""
+    seen = set()
+    for m in messages or []:
+        if m.get("role") != "assistant":
+            continue
+        for tc in (m.get("tool_calls") or []):
+            try:
+                if tc.get("function", {}).get("name") != "read_file":
+                    continue
+                a = json.loads(tc["function"].get("arguments") or "{}")
+                p = a.get("path")
+                if p:
+                    seen.add(os.path.basename(p))
+            except Exception:
+                pass
+    return seen
+
+
+def _design_spec_targets(spec_text):
+    """The set of repo .py basenames that appear in `spec_text` (via r'[\w./-]+\.py'),
+    intersected with the .py files actually present in this file's own directory — so
+    the gate only fires on real, editable targets, not on 'setup.py' or 'urllib.py' the
+    spec mentioned in passing. Empty set if the spec names no in-repo .py."""
+    if not spec_text:
+        return set()
+    names = set(re.findall(r"[\w./-]+\.py", spec_text))
+    if not names:
+        return set()
+    try:
+        here = set(os.listdir(os.path.dirname(os.path.abspath(__file__))))
+    except OSError:
+        return set()
+    return {n for n in names if n in here}
+
+
+def _gate_design_spec(final_text, messages):
+    """Read-gate for design mode. Returns `final_text` unchanged when there is no
+    self-edit spec or the spec is grounded by read_file. Otherwise returns the rstripped
+    plan followed by a "SELF-EDIT SPEC BLOCKED" footer naming which target(s) were not
+    read, so a hallucinated spec is visibly contradicted and a correct one passes through."""
+    if not final_text or _DESIGN_SPEC_MARKER not in final_text:
+        return final_text
+    plan, _, spec = final_text.partition(_DESIGN_SPEC_MARKER)
+    named = _design_spec_targets(spec)
+    read = _design_files_read(messages)
+    if named:
+        missing = sorted(n for n in named if n not in read)
+        if not missing:
+            return final_text
+        targets = ", ".join(missing)
+        return plan.rstrip() + "\n\n=== SELF-EDIT SPEC BLOCKED ===\n" \
+            f"The self-edit spec names {targets} but read_file was never called on it; " \
+            f"the spec is ungrounded, so it was removed."
+    # Spec names no in-repo .py — still require at least one read, so a planner that
+    # just prints a spec without reading anything is also caught.
+    if read:
+        return final_text
+    return plan.rstrip() + "\n\n=== SELF-EDIT SPEC BLOCKED ===\n" \
+        "The self-edit spec was emitted without any read_file call grounding it; " \
+        "the spec is ungrounded, so it was removed."
+
+
 def run_self_edit(task: str, brain=None) -> str:
     """Run a self-edit `task` with ONLY read_file + write_file, on `brain` (default the local coder;
     pass MINIMAX to drive big-file edits on the remote frontier brain — the local coder's 8K context
@@ -1371,7 +1449,7 @@ def run_design(goal: str, brain=None) -> str:
     ]
     final_text, _messages, _built, _outcome = _agent_loop(
         brain, messages, PLAN_TOOLS, checkpoint=False, tag="design")
-    return final_text
+    return _gate_design_spec(final_text, _messages)
 
 
 TOOL_IMPLS = {
