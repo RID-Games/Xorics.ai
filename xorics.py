@@ -251,7 +251,15 @@ def read_file(path: str, max_chars: int = 200000) -> str:
     from pathlib import Path as _P
     fp = _P(path).expanduser()
     if not fp.exists():
-        return f"No file at {path}. Pass a full path, e.g. ~/xorics-ai/prompts/<name>.md."
+        # A model often spells a repo file as a wrong absolute path (guessed home dir) or a
+        # bare name from the wrong cwd. The repo is flat, so fall back to REPO_ROOT/<basename>
+        # before giving up — the intent is almost always "read this repo file". XORICS-FEATURE: read-file
+        alt = _P(REPO_ROOT) / fp.name
+        if alt.exists() and not alt.is_dir():
+            fp = alt
+        else:
+            return (f"No file at {path}. Use the repo-relative name (e.g. the bare filename) "
+                    f"or a full path under {REPO_ROOT}.")
     if fp.is_dir():
         return f"{path} is a directory, not a file. Pass a path to a text file (ls it first)."
     try:
