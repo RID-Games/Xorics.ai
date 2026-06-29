@@ -88,3 +88,18 @@ def _render(cap, count):
 def self_knowledge():
     """The whole self-model as one string — one line per capability, live counts."""
     return "\n".join(_render(cap, _verified_count(cap["domain"])) for cap in CAPABILITIES)
+
+
+def self_knowledge_domain(domain):
+    """Render the single capability line for `domain`, or None if it's not on file.
+
+    Looks the domain up in CAPABILITIES_BY_DOMAIN — that's the gate: unknown
+    domains return None instead of crashing the self-model. Once known, we find
+    the matching cap dict in CAPABILITIES so _render gets the full record.
+    """
+    if domain not in CAPABILITIES_BY_DOMAIN:
+        return None
+    for cap in CAPABILITIES:
+        if cap["domain"] == domain:
+            return _render(cap, _verified_count(domain))
+    return None

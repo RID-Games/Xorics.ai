@@ -113,5 +113,17 @@ try:
 finally:
     _restore()
 
+# 8) self_knowledge_domain(domain): per-domain single-line lookup.
+_stub_counts(firmware=2, pcb=0, android=0)
+unknown = capabilities.self_knowledge_domain("quantum-telekinesis")
+check("(8) self_knowledge_domain unknown domain returns None", unknown is None)
+firmware_line = capabilities.self_knowledge_domain("firmware")
+check("(8) self_knowledge_domain firmware returns a non-empty string",
+      isinstance(firmware_line, str) and bool(firmware_line))
+check('(8) firmware line starts with the firmware label',
+      firmware_line.startswith(capabilities.CAPABILITIES_BY_DOMAIN["firmware"]))
+check('(8) firmware line contains "2 verified skills on file"',
+      "2 verified skills on file" in firmware_line)
+
 print(f"\n{PASS}/{PASS + FAIL} checks passed")
 sys.exit(0 if FAIL == 0 else 1)
