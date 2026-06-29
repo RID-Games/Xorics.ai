@@ -388,6 +388,75 @@ def write_file(path: str, content: str) -> str:
             + (f"\n--- stderr (tail) ---\n{estr[-500:]}" if estr else ""))
 
 
+def str_replace(path: str, old_str: str, new_str: str = "") -> str:
+    """Edit a repo file by replacing a UNIQUE snippet (path RELATIVE to the repo root). The change is
+    applied to a COPY of the tree, the full suite runs in a throwaway container, and it is WRITE VERIFIED
+    only if the suite passes AND the file differs from live — the live repo is NEVER touched. `old_str`
+    must occur EXACTLY ONCE in the current file (the workspace copy, so successive edits in one session
+    accumulate); if it is missing or matches more than once the edit is refused. PREFER this over
+    write_file for editing an EXISTING file: only the snippet is emitted and the rest of the file is
+    preserved byte-for-byte, so you never re-send (or risk corrupting) the lines you are not touching.
+    read_file the target first and copy old_str exactly. XORICS-FEATURE: self-edit"""
+    from pathlib import Path as _P
+    live_abs, ws_abs = _selfedit_resolve(path)
+    if live_abs is None:
+        return ws_abs    # the refusal reason
+    rel = os.path.relpath(ws_abs, os.path.join(_SELFEDIT_WORKSPACE, "work"))
+
+    if not old_str:
+        return "str_replace ERROR: old_str is empty — pass the exact snippet to replace."
+    if sandbox.container_runtime() is None:
+        return ("str_replace ERROR: no container runtime (podman/docker) on PATH — an edit cannot be "
+                "verified safely, so it is refused. Start podman, then retry.")
+    try:
+        ws = _selfedit_stage()
+    except Exception as e:
+        return f"str_replace ERROR: could not stage a workspace copy of the repo: {e}"
+
+    wp = _P(ws_abs)
+    if not wp.exists():
+        return (f"str_replace ERROR: {rel} does not exist — use write_file to CREATE a new file; "
+                "str_replace only edits an existing one.")
+    try:
+        current = wp.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"str_replace ERROR: could not read {rel} from the workspace: {e}"
+
+    n = current.count(old_str)
+    if n == 0:
+        return (f"str_replace ERROR: old_str not found in {rel}. Copy it EXACTLY from read_file output "
+                "(whitespace included) — it must match the current file.")
+    if n > 1:
+        return (f"str_replace ERROR: old_str matches {n} places in {rel} — it must be unique. Add more "
+                "surrounding context so it identifies exactly one location.")
+
+    try:
+        wp.write_text(current.replace(old_str, new_str, 1), encoding="utf-8")
+    except Exception as e:
+        return f"str_replace ERROR: could not write {rel} into the workspace: {e}"
+
+    lp = _P(live_abs)
+    if lp.exists() and lp.read_bytes() == wp.read_bytes():
+        return (f"NO CHANGE: after the replacement {rel} is byte-identical to the live file — nothing to "
+                "verify. If you meant to change it, check that old_str and new_str differ.")
+
+    res = sandbox.run(ws, _SELFEDIT_VERIFY_CMD, artifacts=[rel],
+                      image=_selfedit_image(), network=False)
+    if res.error:
+        return f"str_replace ERROR: the sandbox could not run the suite: {res.error}"
+    if res.ok:
+        return (f"WRITE VERIFIED: {rel} edited (1 replacement) and the full suite PASSED inside the "
+                f"sandbox (exit 0, {res.elapsed:.0f}s). The live tree is untouched; the verified copy is "
+                f"staged at {ws}. It awaits the user's approval before being promoted. You are DONE — "
+                "report what you changed; do not edit further.")
+    tail = (res.stdout or "")[-1400:]
+    estr = (res.stderr or "").strip()
+    return (f"WRITE REJECTED: {rel} was edited but the suite FAILED inside the sandbox "
+            f"(exit {res.exit_code}). The live tree is untouched. Read the failing output below, fix the "
+            f"file, and edit again.\n--- suite output (tail) ---\n{tail}"
+            + (f"\n--- stderr (tail) ---\n{estr[-500:]}" if estr else ""))
+
+
 # ---- self-edit: review + promote a verified change to the live repo (Brick C) -
 # The ONLY path that writes to the LIVE tree, and only behind explicit human approval —
 # there is deliberately NO tool for this, so the coder/manager can never self-promote.
@@ -672,6 +741,24 @@ TOOLS = [
                      "repo root (e.g. 'notebook.py' or 'tools/foo.py'). Absolute/~ paths are refused."},
             "content": {"type": "string", "description": "The COMPLETE new contents of the file."}},
             "required": ["path", "content"]}}},
+    {"type": "function", "function": {
+        "name": "str_replace",
+        "description": "Edit Xorics's OWN source by replacing a UNIQUE snippet in an EXISTING repo file "
+                       "(path RELATIVE to the repo root). PREFER this over write_file for editing an "
+                       "existing file: send only old_str (copied exactly from read_file, unique in the "
+                       "file) and new_str, and the rest of the file is preserved byte-for-byte — no need "
+                       "to re-emit the whole file. Applies to a COPY of the tree, runs the FULL suite in a "
+                       "throwaway container, and reports WRITE VERIFIED only if it passes AND the file "
+                       "changed. If old_str is missing or not unique, add surrounding context and retry.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Path to the repo file to edit, RELATIVE to the "
+                     "repo root (e.g. 'xorics.py'). Absolute/~ paths are refused."},
+            "old_str": {"type": "string", "description": "Exact snippet to replace, copied verbatim from "
+                        "read_file output. Must appear EXACTLY ONCE in the file (include surrounding lines "
+                        "to make it unique)."},
+            "new_str": {"type": "string", "description": "Replacement text. Pass an empty string to "
+                        "delete the snippet."}},
+            "required": ["path", "old_str", "new_str"]}}},
 ]
 
 # Manager (gpt-oss) routes + delegates; it does NOT compile directly.
@@ -698,7 +785,7 @@ FIRMWARE_TOOLS = [t for t in TOOLS if t["function"]["name"]
 # NARROW — none of the PCB / firmware / build tools — so a self-edit delegation can only read and
 # propose-verified-write, nothing else (the firmware-gate pattern, applied to self-edit).
 # XORICS-FEATURE: self-edit
-SELF_EDIT_TOOLS = [t for t in TOOLS if t["function"]["name"] in ("read_file", "write_file")]
+SELF_EDIT_TOOLS = [t for t in TOOLS if t["function"]["name"] in ("read_file", "write_file", "str_replace")]
 
 # Planning-only toolset: the planner proposing what an Xorics change should look like, BEFORE
 # any /selfedit run. read_file only — no write_file, no sandbox, no build tools. The planner
@@ -1289,21 +1376,27 @@ _SELF_EDIT_GUIDE = (
     "You are editing Xorics's OWN source code (a Python repo). Work in small, verified steps:\n"
     "1. read_file the target file (path RELATIVE to the repo root, e.g. 'notebook.py') to see exactly "
     "what is there now — never guess the current contents.\n"
-    "2. Make the SMALLEST change that satisfies the task. Preserve everything else byte-for-byte: "
-    "re-send the WHOLE file content to write_file with only your change applied.\n"
-    "3. write_file applies your version to a COPY of the repo and runs the FULL test suite in a "
-    "sandbox. It returns WRITE VERIFIED only if the suite passes AND the file actually changed. The "
-    "live code is never touched, and you do NOT get to choose how it is verified.\n"
-    "4. If it returns WRITE REJECTED, read the failing test output, fix the file, and write_file again "
-    "— iterate until the suite passes. If it returns WRITE VERIFIED, STOP and report what you changed; "
-    "the change then waits for the user's approval before it is promoted.\n"
-    "read_file and write_file are your ONLY tools by design — do not try to run shell commands, design "
-    "boards, or write firmware here.\n"
+    "2. PREFER str_replace for editing an EXISTING file: pass old_str (a snippet copied EXACTLY from "
+    "read_file, with enough surrounding lines that it appears exactly ONCE in the file) and new_str. "
+    "Only that snippet changes; the rest of the file is preserved mechanically, so you never re-emit — "
+    "or risk corrupting — the hundreds of lines you are not touching. Use write_file (whole new "
+    "contents) ONLY to create a brand-new file or do a deliberate full rewrite. Either way make the "
+    "SMALLEST change that satisfies the task.\n"
+    "3. Whichever you use applies your change to a COPY of the repo and runs the FULL test suite in a "
+    "sandbox, returning WRITE VERIFIED only if the suite passes AND the file actually changed. The live "
+    "code is never touched, and you do NOT get to choose how it is verified.\n"
+    "4. If str_replace says old_str was not found or matched more than once, copy it again exactly and "
+    "add more surrounding context until it is unique. If a write returns WRITE REJECTED, read the failing "
+    "test output, fix it, and edit again — iterate until the suite passes. On WRITE VERIFIED, STOP and "
+    "report what you changed; the change then waits for the user's approval before it is promoted.\n"
+    "read_file, str_replace and write_file are your ONLY tools by design — do not try to run shell "
+    "commands, design boards, or write firmware here.\n"
     "TRUNCATION — read this twice: read_file caps output at its max_chars. If what comes back ENDS IN a "
     "'[truncated at N of M chars]' marker, you do NOT have the whole file — only the first N of M chars. "
-    "write_file expects the COMPLETE new contents, so writing a file you have only partially seen would "
-    "silently delete everything past N. NEVER do that. When you see that marker, re-read with a larger "
-    "max_chars (e.g. read_file(path, max_chars=400000)) until it is gone, and only then edit and write.")
+    "This is most dangerous for write_file, which expects the COMPLETE contents (writing a partially-seen "
+    "file silently deletes everything past N — NEVER do that); str_replace is safer since it only touches "
+    "the snippet, but you still must have seen the snippet you are matching. When you see that marker, "
+    "re-read with a larger max_chars (e.g. read_file(path, max_chars=400000)) until it is gone.")
 
 
 # ---- design mode: planner proposes an Xorics change (READ-ONLY) ---------------
@@ -1535,6 +1628,7 @@ TOOL_IMPLS = {
     "check_circuit_file": check_circuit_file,
     "read_file": read_file,
     "write_file": write_file,
+    "str_replace": str_replace,
     "find_part": find_part,
     "find_footprint": find_footprint,
     "part_pins": part_pins,
