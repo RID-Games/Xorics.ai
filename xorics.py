@@ -1479,6 +1479,7 @@ _PLANNER_GUIDE = (
 # likewise blocked unless at least one read happened — so a planner that just prints a
 # spec without reading anything is caught too. XORICS-FEATURE: design-mode
 _DESIGN_SPEC_MARKER = "=== SELF-EDIT SPEC ==="
+_LAST_DESIGN_SPEC = None
 
 
 def _design_files_read(messages):
@@ -1615,7 +1616,11 @@ def run_design(goal: str, brain=None) -> str:
     ]
     final_text, _messages, _built, _outcome = _agent_loop(
         brain, messages, PLAN_TOOLS, checkpoint=False, tag="design")
-    return _gate_design_spec(final_text, _messages)
+    result = _gate_design_spec(final_text, _messages)
+    global _LAST_DESIGN_SPEC
+    _b, _m, _s = result.partition(_DESIGN_SPEC_MARKER)
+    _LAST_DESIGN_SPEC = _s.strip() if _m else None
+    return result
 
 
 TOOL_IMPLS = {
@@ -1634,6 +1639,16 @@ TOOL_IMPLS = {
     "part_pins": part_pins,
     "delegate_to_coder": delegate_to_coder,
 }
+
+
+def run_build(brain=None):
+    """Hand the last /design spec to /selfedit: if no spec is on hand, print a one-liner guiding
+    the user to /design <goal> first; otherwise forward the saved spec to run_self_edit with the
+    same brain-selection rule as the /selfedit command (MiniMax in /power mode, else the local
+    coder). XORICS-FEATURE: design-mode"""
+    if not _LAST_DESIGN_SPEC:
+        return "Nothing to build: no design spec on hand. Run /design <goal>, read the PLAN, then /build."
+    return run_self_edit(_LAST_DESIGN_SPEC, brain=brain)
 
 
 def active_tools():
@@ -1820,7 +1835,7 @@ if __name__ == "__main__":
         sys.exit()
 
     print(f"{NAME} — local AI. The manager delegates coding to the coder automatically.")
-    print("commands: /code (coder)  /selfedit (edit Xorics, sandbox-verified; /power first → drive on M3)  /design (plan one change, read-only)  /plan (break a feature into small bricks; /power for M3)  /promote /discard (approve or drop a self-edit)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
+    print("commands: /code (coder)  /selfedit (edit Xorics, sandbox-verified; /power first → drive on M3)  /design (plan one change, read-only)  /build (run /selfedit on the last /design spec)  /plan (break a feature into small bricks; /power for M3)  /promote /discard (approve or drop a self-edit)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
     print(f"coder pauses every {CHECKPOINT_EVERY} steps to check in (no cap); backstop {CODER_BACKSTOP} when unattended.\n")
     if _CHAT_HISTORY:
         print(f"(resumed {len(_CHAT_HISTORY)} remembered messages — /reset to start fresh)\n")
@@ -1884,6 +1899,10 @@ if __name__ == "__main__":
                 q = q[5:].strip()
                 if not q:
                     continue
+            elif q == "/build" or q.startswith("/build "):   # XORICS-FEATURE: design-mode
+                driver = MINIMAX if BRAIN == MINIMAX else CODER
+                print(f"\n{NAME.lower()}>", run_build(brain=driver), "\n")
+                continue
             elif q == "/design" or q.startswith("/design "):   # XORICS-FEATURE: design-mode
                 goal = q[7:].strip()
                 if not goal:
