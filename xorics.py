@@ -190,6 +190,12 @@ def client_for(model):
 # delegates to it instead.
 BRAIN = MANAGER
 
+# Planning mode (the /plan conversational planner). Orthogonal to BRAIN: it swaps the chat
+# system prompt for the planner guide and restricts to read-only tools, on WHATEVER brain is
+# active (use /power for M3's stronger breakdown). Module-level so ask() can read it on every
+# path, including the bridge/app, which never turn it on. XORICS-FEATURE: plan-mode
+PLAN_MODE = False
+
 
 # ---- web search ---------------------------------------------------------------
 def web_search(query: str, max_results: int = 5) -> str:
@@ -1328,6 +1334,39 @@ _DESIGN_GUIDE = (
     "changes. The user decides whether to run /selfedit with the spec.")
 
 
+_PLANNER_GUIDE = (
+    "You are the Xorics PLANNING PARTNER. You help the user take a LARGE change to Xorics's OWN "
+    "source code and break it into a sequence of SMALL, independently-shippable bricks, then guide "
+    "building them one at a time. You are a collaborator in an ongoing conversation: you propose a "
+    "breakdown, the user reacts, you refine together. You are STRICTLY READ-ONLY — your only tool is "
+    "read_file. You do NOT write_file, run shell, build boards, design firmware, start the sandbox, "
+    "or delegate to the coder. You plan; the user runs /design and /selfedit to actually build.\n"
+    "METHOD (this is how Xorics itself is built — follow it):\n"
+    "- Draft-then-fix, never one-shot perfection: the SMALLEST increment that works and is "
+    "verifiable goes first, gets proven, THEN the next brick. main always stays buildable.\n"
+    "- Ground everything in the real source. BEFORE proposing a breakdown, read_file the file(s) the "
+    "feature touches (xorics.py is the main one) so the plan fits what is actually on disk, not what "
+    "you assume is there. TRUNCATION RULE: if read_file output ends in a '[truncated at N of M "
+    "chars]' marker you only have the first N chars — re-read with a larger max_chars "
+    "(e.g. read_file(path, max_chars=400000)) until the marker is gone.\n"
+    "- One brick = one localised change to one or two files, carrying its own test, that leaves the "
+    "suite green. Prefer adding a small thing over refactoring an existing one.\n"
+    "WHEN THE USER DESCRIBES A FEATURE:\n"
+    "1. read_file the relevant source to ground yourself.\n"
+    "2. Produce an ORDERED, numbered list of bricks. For EACH brick give: what it changes "
+    "(file / function), why it is small and shippable on its own, and how it is verified (a new test "
+    "plus the existing suite in the sandbox, or a named live smoke test). Order them so each brick "
+    "leaves the tree working and the next builds on it.\n"
+    "3. Then STOP and discuss — invite the user to cut, reorder, merge, or resize bricks. Do not "
+    "start building.\n"
+    "WHEN THE USER PICKS A BRICK TO BUILD:\n"
+    "- read_file the target file, then emit a single line the user can paste straight into "
+    "/selfedit: a complete, self-contained task for exactly that ONE brick (same shape /design "
+    "produces) — no leading bullet, no trailing commentary. One brick at a time; never bundle.\n"
+    "Be direct and concrete. Push back when a brick is too big to ship or verify on its own. No "
+    "filler and no cheerleading — you are an engineer helping another engineer think.")
+
+
 # Mechanical read-gate for design mode: run_design cannot emit a self-edit spec unless
 # read_file actually fired on the file(s) that spec targets. The plan/sandbox tools are
 # read-only, but a planner can still SKIP reading and hallucinate a spec for any file —
@@ -1643,6 +1682,8 @@ def ask(user_message: str, history=None) -> str:
     is_coder = BRAIN == CODER
     if is_coder:
         system = f"You are {NAME}, the coding specialist, in manual coding mode. " + _CODER_GUIDE
+    elif PLAN_MODE:                              # XORICS-FEATURE: plan-mode (read-only planner persona)
+        system = _PLANNER_GUIDE + "\n\n" + capabilities.self_knowledge()
     else:
         system = _MANAGER_PERSONA + "\n\n" + capabilities.self_knowledge() + "\n\n" + _MANAGER_ROUTING
     messages = [{"role": "system", "content": system}]
@@ -1652,7 +1693,8 @@ def ask(user_message: str, history=None) -> str:
 
     # Only the coder grind gets human check-ins; the manager just routes (backstop only).
     _deliv_before = len(_load_deliverables())    # honesty-gate: footer diffs deliverables added this turn
-    final_text, messages, built_path, outcome = _agent_loop(BRAIN, messages, active_tools(),
+    tools = PLAN_TOOLS if (PLAN_MODE and not is_coder) else active_tools()   # plan mode is read-only
+    final_text, messages, built_path, outcome = _agent_loop(BRAIN, messages, tools,
                                                    checkpoint=is_coder, tag=("coder" if is_coder else "tool"))
 
     if is_coder:
@@ -1676,23 +1718,28 @@ if __name__ == "__main__":
         sys.exit()
 
     print(f"{NAME} — local AI. The manager delegates coding to the coder automatically.")
-    print("commands: /code (coder)  /selfedit (edit Xorics, sandbox-verified; /power first → drive on M3)  /design (plan an Xorics change, read-only — no writes)  /promote /discard (approve or drop a self-edit)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
+    print("commands: /code (coder)  /selfedit (edit Xorics, sandbox-verified; /power first → drive on M3)  /design (plan one change, read-only)  /plan (break a feature into small bricks; /power for M3)  /promote /discard (approve or drop a self-edit)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
     print(f"coder pauses every {CHECKPOINT_EVERY} steps to check in (no cap); backstop {CODER_BACKSTOP} when unattended.\n")
     if _CHAT_HISTORY:
         print(f"(resumed {len(_CHAT_HISTORY)} remembered messages — /reset to start fresh)\n")
     while True:
         try:
-            tag = "code" if BRAIN == CODER else ("power" if BRAIN == MINIMAX else "chat")
+            if BRAIN == CODER:
+                tag = "code"
+            elif PLAN_MODE:
+                tag = "plan/power" if BRAIN == MINIMAX else "plan"
+            else:
+                tag = "power" if BRAIN == MINIMAX else "chat"
             q = input(f"you[{tag}]> ").strip()
             if not q:
                 continue
             if q == "/code" or q.startswith("/code "):   # XORICS-FEATURE: coder-control
-                BRAIN = CODER; print("→ manual coding mode (driving qwen3-coder directly)\n")
+                BRAIN = CODER; PLAN_MODE = False; print("→ manual coding mode (driving qwen3-coder directly)\n")
                 q = q[5:].strip()
                 if not q:
                     continue
             elif q == "/chat" or q.startswith("/chat "):
-                BRAIN = MANAGER; print("→ manager mode (gpt-oss; delegates coding)\n")
+                BRAIN = MANAGER; PLAN_MODE = False; print("→ manager mode (gpt-oss; delegates coding)\n")
                 q = q[5:].strip()
                 if not q:
                     continue
@@ -1705,7 +1752,7 @@ if __name__ == "__main__":
                 q = q[6:].strip()
                 if not q:
                     continue
-            elif q == "/local" or q.startswith("/local "):   # off-switch for /power (same as /chat)
+            elif q == "/local" or q.startswith("/local "):   # brain off-switch for /power (keeps /plan; /chat fully exits)
                 BRAIN = MANAGER; print(f"→ local manager mode ({MANAGER})\n")
                 q = q[6:].strip()
                 if not q:
@@ -1726,6 +1773,15 @@ if __name__ == "__main__":
                 ans = run_self_edit(task, brain=driver)
                 print(f"\n{NAME.lower()}>", ans, "\n")
                 continue
+            elif q == "/plan" or q.startswith("/plan "):   # XORICS-FEATURE: plan-mode
+                PLAN_MODE = True
+                where = "MiniMax M3, remote" if BRAIN == MINIMAX else f"{BRAIN}, local"
+                print(f"→ planning mode (partner: {where}; read-only — breaks a feature into small, "
+                      "shippable bricks and walks you through building them one at a time. "
+                      "/power for M3's stronger breakdown; /chat to exit)\n")
+                q = q[5:].strip()
+                if not q:
+                    continue
             elif q == "/design" or q.startswith("/design "):   # XORICS-FEATURE: design-mode
                 goal = q[7:].strip()
                 if not goal:
