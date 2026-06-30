@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
 import android.widget.Button
+import android.widget.EditText
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -30,6 +31,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var listen: Button
     private lateinit var wake: Button
     private lateinit var forceStop: Button
+    private lateinit var input: EditText
+    private lateinit var send: Button
     // private lateinit var diagView: TextView   // DEBUG: on-screen audio diagnostic
 
     private val recordMs = 6000L
@@ -76,6 +79,10 @@ class MainActivity : AppCompatActivity() {
         listen.setOnClickListener { toggleListening() }
         wake.setOnClickListener { toggleWake() }
         forceStop.setOnClickListener { forceStopAndExit() }
+
+        input = findViewById(R.id.input)
+        send = findViewById(R.id.send)
+        send.setOnClickListener { sendTyped() }
     }
 
     override fun onResume() {
@@ -182,6 +189,28 @@ class MainActivity : AppCompatActivity() {
         }
         finishAndRemoveTask()
         android.os.Process.killProcess(android.os.Process.myPid())
+    }
+
+    // ---- typed chat ----
+    private fun sendTyped() {
+        val text = input.text.toString().trim()
+        if (text.isBlank()) return
+        input.setText("")
+        lifecycleScope.launch {
+            send.isEnabled = false
+            transcript.text = "you: $text"
+            reply.text = ""
+            setStatus("thinking…")
+            try {
+                val answer = withContext(Dispatchers.IO) { Bridge.chat(text) }
+                reply.text = "xorics: $answer"
+                setStatus("done — type or tap to talk")
+            } catch (e: Exception) {
+                setStatus("error: ${e.message}")
+            } finally {
+                send.isEnabled = true
+            }
+        }
     }
 
     // ---- one-shot foreground roundtrip ----

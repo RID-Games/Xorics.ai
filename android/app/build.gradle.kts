@@ -1,6 +1,7 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 android {
@@ -11,8 +12,8 @@ android {
         applicationId = "com.rid.xorics"
         minSdk = 26
         targetSdk = 35
-        versionCode = 7
-        versionName = "0.6"
+        versionCode = 11
+        versionName = "0.10"
     }
 
     buildTypes {
@@ -32,6 +33,9 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+    buildFeatures {
+        compose = true
+    }
 }
 
 dependencies {
@@ -43,4 +47,14 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     // On-device wake-word / offline STT (Apache-2.0). Pulls JNA transitively.
     implementation("com.alphacephei:vosk-android:0.3.75")
+
+    // --- Jetpack Compose (chat UI). BOM pins all compose artifact versions together. ---
+    val composeBom = platform("androidx.compose:compose-bom:2024.09.03")
+    implementation(composeBom)
+    implementation("androidx.activity:activity-compose:1.9.2")
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.compose.material3:material3")
+    debugImplementation("androidx.compose.ui:ui-tooling")
 }

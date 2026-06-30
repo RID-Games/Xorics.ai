@@ -17,14 +17,25 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.Xorics">
 
+        <!-- Chat is the front door now. -->
         <activity
-            android:name=".MainActivity"
+            android:name=".ChatActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- The voice/diagnostics control panel, opened from ChatActivity's "Voice" action. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="false" />
+
+        <!-- File explorer, opened from ChatActivity's "Files" action. -->
+        <activity
+            android:name=".FilesActivity"
+            android:exported="false" />
 
         <service
             android:name=".VoiceService"

@@ -115,3 +115,9 @@ and we extend the list (or switch to a grammar) from real output.
 - If sync fails on the Vosk dependency, try version 0.3.70 or 0.3.47.
 - If JNA errors at build, add: implementation("net.java.dev.jna:jna:5.13.0@aar")
 - "Model missing" notification = the adb push didn't land in .../files/model.
+
+## v0.7 — typing
+Text box + Send at the top. Posts straight to /v1/chat/completions (the same chat the
+voice path uses) — no STT, no bridge change. Shows the reply as text (doesn't speak it).
+Pure app feature. Next: attach plain-text files (app-only), then photos (needs a bridge
+vision route to the :8081 VLM).
