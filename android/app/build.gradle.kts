@@ -48,6 +48,9 @@ dependencies {
     // On-device wake-word / offline STT (Apache-2.0). Pulls JNA transitively.
     implementation("com.alphacephei:vosk-android:0.3.75")
 
+    // Pure-JVM tests for the G2 protocol/display oracles (g2/ package): ./gradlew test
+    testImplementation("junit:junit:4.13.2")
+
     // --- Jetpack Compose (chat UI). BOM pins all compose artifact versions together. ---
     val composeBom = platform("androidx.compose:compose-bom:2024.09.03")
     implementation(composeBom)

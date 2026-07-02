@@ -47,6 +47,7 @@ from starlette.concurrency import run_in_threadpool
 
 import xorics   # pulls in the whole assistant; the REPL is __main__-guarded, so import is safe
 from api import make_router   # app-facing REST API (projects/chats/messages); see api.py
+from glasses_bus import make_glasses_router   # G2 glasses command/event bus; see glasses_bus.py
 
 # --- one-time setup ----------------------------------------------------------
 xorics.BRAIN = xorics.MANAGER   # glasses/phone talk to the manager; it routes to the coder itself
@@ -305,6 +306,10 @@ app.post("/")(_chat)
 # App-facing API: projects / chats / messages, persisted + memory-backed (api.py).
 # Additive — the OpenAI route above is untouched, so the glasses/Even Hub keep working.
 app.include_router(make_router(_run_ask_full, _auth))
+
+# G2 base system bus: Xorics plugins enqueue commands, the RID app long-polls them
+# and reports events/BLE frames back. Additive; see glasses_bus.py + xorics_glasses.py.
+app.include_router(make_glasses_router(_auth))
 
 
 @app.get("/healthz")
