@@ -64,7 +64,6 @@ class GlassesLink(
     }
 
     private val handler = Handler(Looper.getMainLooper())
-    private val serviceUuid = UUID.fromString(GlassesProtocol.UUID_SERVICE)
     private val writeUuid = UUID.fromString(GlassesProtocol.UUID_WRITE)
     private val notifyUuid = UUID.fromString(GlassesProtocol.UUID_NOTIFY)
     private val cccdUuid = UUID.fromString(GlassesProtocol.CCCD_UUID)
@@ -185,11 +184,30 @@ class GlassesLink(
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) { fail("Service discovery failed (status $status)"); return }
-            val svc = g.getService(serviceUuid)
-            if (svc == null) { fail("G2 service $serviceUuid not found"); return }
-            val notify = svc.getCharacteristic(notifyUuid)
-            val write = svc.getCharacteristic(writeUuid)
-            if (notify == null || write == null) { fail("0x5401/0x5402 characteristics missing"); return }
+
+            // The working reference (bleak) addresses characteristics globally and never names
+            // a service, so we do the same: search every discovered service for 0x5401/0x5402
+            // rather than assuming a service UUID (the earlier 0x0000 guess was wrong — the
+            // device has no such service). Dump the full GATT table once so the real service
+            // UUID is on record and we never have to guess it again.
+            var write: BluetoothGattCharacteristic? = null
+            var notify: BluetoothGattCharacteristic? = null
+            val table = StringBuilder("GATT:")
+            for (svc in g.services) {
+                table.append(" [").append(svc.uuid).append(":")
+                for (ch in svc.characteristics) {
+                    table.append(" ").append(ch.uuid.toString().takeLast(4))
+                    if (ch.uuid == writeUuid) write = ch
+                    if (ch.uuid == notifyUuid) notify = ch
+                }
+                table.append("]")
+            }
+            listener.onState(table.toString())
+
+            if (write == null || notify == null) {
+                fail("0x5401/0x5402 not found across ${g.services.size} services — see GATT dump above")
+                return
+            }
             writeChar = write
 
             // Enable notifications on 0x5402: local flag + CCCD descriptor write (0x0100).
