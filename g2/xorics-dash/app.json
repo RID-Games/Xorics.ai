@@ -1,0 +1,13 @@
+{
+  "package_id": "com.rid.xoricsdash",
+  "edition": "202601",
+  "name": "Xorics Dash",
+  "version": "0.1.0",
+  "min_app_version": "2.0.0",
+  "min_sdk_version": "0.0.11",
+  "entrypoint": "index.html",
+  "permissions": [
+    { "name": "app-location", "desc": "Live position for turn-by-turn navigation." }
+  ],
+  "supported_languages": ["en"]
+}

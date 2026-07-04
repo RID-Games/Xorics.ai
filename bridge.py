@@ -48,6 +48,7 @@ from starlette.concurrency import run_in_threadpool
 import xorics   # pulls in the whole assistant; the REPL is __main__-guarded, so import is safe
 from api import make_router   # app-facing REST API (projects/chats/messages); see api.py
 from glasses_bus import make_glasses_router   # G2 glasses command/event bus; see glasses_bus.py
+from dashboard_router import make_dashboard_router   # glasses HUD dashboard pages; see dashboard_router.py
 
 # --- one-time setup ----------------------------------------------------------
 xorics.BRAIN = xorics.MANAGER   # glasses/phone talk to the manager; it routes to the coder itself
@@ -310,6 +311,10 @@ app.include_router(make_router(_run_ask_full, _auth))
 # G2 base system bus: Xorics plugins enqueue commands, the RID app long-polls them
 # and reports events/BLE frames back. Additive; see glasses_bus.py + xorics_glasses.py.
 app.include_router(make_glasses_router(_auth))
+
+# Glasses HUD dashboard: feeds the "Xorics Dash" Even Hub WebView app via the
+# same-origin Vite proxy (:5174 /page/* -> /dashboard/*). Additive; see dashboard_router.py.
+app.include_router(make_dashboard_router(_auth))
 
 
 @app.get("/healthz")
