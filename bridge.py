@@ -58,6 +58,9 @@ if hasattr(xorics, "_CHAT_HISTORY") and hasattr(xorics, "_load_history"):
     xorics._CHAT_HISTORY[:] = xorics._load_history()
 
 _ASK_LOCK = threading.Lock()    # ask() drives one global brain over llama-swap — serialize
+_LAST_ASK = {"text": None, "ts": None}  # last ask through THIS process — xorics.ask() is stateless
+                                        # by contract, so the dashboard agent page reads this, not
+                                        # xorics._CHAT_HISTORY (which never updates on bridge asks).
 _TOKEN = os.environ.get("XORICS_BRIDGE_TOKEN")
 
 WHISPER_URL = os.environ.get("XORICS_WHISPER_URL", "http://127.0.0.1:8084/inference")
@@ -111,6 +114,7 @@ def _run_ask(text, history=None):
     # One ask() at a time. A delegate_to_coder run is minutes + two GPU swaps — fine over
     # the phone (it waits), but the glasses/Even Hub will time out on those.
     with _ASK_LOCK:
+        _LAST_ASK.update(text=text, ts=time.time())   # dashboard agent page (see _LAST_ASK above)
         return str(xorics.ask(text, history=history))
 
 
@@ -121,6 +125,7 @@ def _run_ask_full(text, history=None):
     # build — the reliable source is the honesty-ledger diff, taken here INSIDE the lock (so a
     # concurrent turn can't muddy the before/after) around this one ask() call. XORICS-FEATURE: deliverables-to-store
     with _ASK_LOCK:
+        _LAST_ASK.update(text=text, ts=time.time())   # dashboard agent page (see _LAST_ASK above)
         _deliv_before = len(xorics._load_deliverables())
         r = xorics.ask(text, history=history)
         fresh = [d["path"] for d in xorics._load_deliverables()[_deliv_before:]
@@ -314,7 +319,9 @@ app.include_router(make_glasses_router(_auth))
 
 # Glasses HUD dashboard: feeds the "Xorics Dash" Even Hub WebView app via the
 # same-origin Vite proxy (:5174 /page/* -> /dashboard/*). Additive; see dashboard_router.py.
-app.include_router(make_dashboard_router(_auth))
+app.include_router(make_dashboard_router(_auth,
+                                         busy=_ASK_LOCK.locked,          # live: an ask() holds it
+                                         last_ask=lambda: dict(_LAST_ASK)))  # copy — no shared mutation
 
 
 @app.get("/healthz")
