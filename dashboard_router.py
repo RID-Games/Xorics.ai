@@ -34,7 +34,7 @@ AGENT page — every field is real state, no narration:
 
 NAV page — wraps xorics_nav.py (repo root; GraphHopper :8989 on RIDGames):
     Route points come from ?from=LAT,LON&to=LAT,LON, else XORICS_NAV_ROUTE,
-    else the proven smoke route (Ferry Building -> Golden Gate Bridge).
+    else the curl-proven WI route (Lambeau Field -> New Franken).
     Renders: totals, the first turn block, and a next-turn preview.
     xorics_nav.route()/parse_point() raise SystemExit (CLI idiom) — caught
     explicitly here, since `except Exception` would NOT catch it and a
@@ -57,10 +57,10 @@ from starlette.concurrency import run_in_threadpool
 
 NEWS_FEED = os.environ.get("XORICS_NEWS_FEED", "https://feeds.bbci.co.uk/news/world/rss.xml")
 
-# Ferry Building -> Golden Gate Bridge: the exact pair the terminal smoke test
-# proved against the local California extract (5-step route).
+# Lambeau Field -> New Franken: the exact pair curl-proven against the local
+# Wisconsin extract (Geofabrik 2026-07-03; ~23 km, 12-step car route).
 DEFAULT_ROUTE = os.environ.get("XORICS_NAV_ROUTE",
-                               "37.7955,-122.3937 37.8199,-122.4783")
+                               "44.5013,-88.0622 44.5433,-87.8262")
 
 MAX_LINES = 9   # fits the 560x272 body pane with headroom; tune on-lens
 MAX_CHARS = 26  # raw-BLE formatter used 25; SDK font metrics unknown; tune on-lens
