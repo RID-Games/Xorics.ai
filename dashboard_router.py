@@ -33,7 +33,9 @@ AGENT page — every field is real state, no narration:
              files a validator actually passed. Empty ledger -> "—", honestly.
 
 NAV page — wraps xorics_nav.py (repo root; GraphHopper :8989 on RIDGames):
-    Route points come from ?from=LAT,LON&to=LAT,LON, else XORICS_NAV_ROUTE,
+    Route points come from ?from=LAT,LON&to=LAT,LON, else the manager-set
+    active route (xorics_nav.load_active_route — written by the show_route
+    tool; adds a "to: <label>" line when labeled), else XORICS_NAV_ROUTE,
     else the curl-proven WI route (Lambeau Field -> New Franken).
     Renders: totals, the first turn block, and a next-turn preview.
     xorics_nav.route()/parse_point() raise SystemExit (CLI idiom) — caught
@@ -156,7 +158,19 @@ def _nav_lines(frm: str | None, to: str | None) -> list[str]:
 
     if (frm is None) != (to is None):   # exactly one given — ambiguous, refuse
         return ["need BOTH from & to", "or neither (default)"]
-    spec = "%s %s" % (frm, to) if frm else DEFAULT_ROUTE
+    label = None
+    if frm:
+        spec = "%s %s" % (frm, to)
+    else:
+        # Manager-set route (show_route tool) beats the launch-time default.
+        # getattr guards version skew: an older xorics_nav on disk without the
+        # helper must degrade to the default, not 500 the lens.
+        # XORICS-FEATURE: nav-tool
+        active = getattr(xorics_nav, "load_active_route", lambda: None)()
+        if active:
+            spec, label = active["points"], active.get("label")
+        else:
+            spec = DEFAULT_ROUTE
 
     try:
         pts = [xorics_nav.parse_point(p) for p in spec.split()]
@@ -181,6 +195,8 @@ def _nav_lines(frm: str | None, to: str | None) -> list[str]:
         lines.append(step[2])
     if len(blocks) > 1:
         lines.append("then: " + blocks[1].split("\n")[0])
+    if label:
+        lines.append("to: " + label)   # manager-set destination, user's words
     return lines
 
 

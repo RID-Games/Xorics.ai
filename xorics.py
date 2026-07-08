@@ -57,6 +57,7 @@ from web_datasheets import fetch_datasheet          # web -> index a datasheet P
 from firmware_tools import compile_check, save_sketch
 from notebook import Notebook                                              # XORICS-FEATURE: coder-notebook
 from pcb_tools import check_circuit, check_circuit_file, find_part, find_footprint, part_pins, save_circuit   # SKiDL: search + run ERC
+from xorics_nav import show_route, clear_route       # G2 glasses nav (GraphHopper :8989)  XORICS-FEATURE: nav-tool
 import skills                                       # XORICS-FEATURE: skill-write-on-success
 import capabilities
 import sandbox                                       # XORICS-FEATURE: self-edit (throwaway-container verify)
@@ -607,6 +608,24 @@ TOOLS = [
             "question": {"type": "string", "description": "What to look for in the image."}},
             "required": ["path"]}}},
     {"type": "function", "function": {
+        "name": "show_route",
+        "description": "Compute a driving route and SHOW it on the user's glasses Nav page, where it "
+                       "stays until replaced or cleared. COORDINATES ONLY: pass 'LAT,LON' strings. "
+                       "There is no geocoder and no GPS yet — if the user gives a street address or "
+                       "place you do not have trusted coordinates for, say you can't geocode yet; "
+                       "NEVER invent coordinates. Omit origin to start from the configured default point.",
+        "parameters": {"type": "object", "properties": {
+            "destination": {"type": "string", "description": "Destination as 'LAT,LON', e.g. '44.5433,-87.8262'."},
+            "origin": {"type": "string", "description": "Start as 'LAT,LON'. Omit to use the default origin (no GPS yet)."},
+            "label": {"type": "string", "description": "Short human name for the destination, shown on the HUD "
+                      "— use the user's own words, e.g. 'New Franken'."}},
+            "required": ["destination"]}}},
+    {"type": "function", "function": {
+        "name": "clear_route",
+        "description": "Remove the route show_route put on the glasses Nav page; the page returns to "
+                       "its default preview route.",
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
         "name": "search_datasheets",
         "description": "Search the local hardware-doc index (datasheets, ESP32-C3 reference, pin maps) "
                        "for parts, registers, pinouts, or specs. Use instead of guessing.",
@@ -764,7 +783,7 @@ TOOLS = [
 # Manager (gpt-oss) routes + delegates; it does NOT compile directly.
 MANAGER_TOOLS = [t for t in TOOLS if t["function"]["name"]
                  in ("web_search", "see_image", "search_datasheets", "delegate_to_coder",
-                     "finalize_design")]
+                     "finalize_design", "show_route", "clear_route")]
 # Coder's own toolset (used inside delegate_to_coder and in manual /code mode).
 CODER_TOOLS = [t for t in TOOLS if t["function"]["name"]
                in ("compile_check", "check_circuit_file", "validate_circuit",
@@ -969,6 +988,9 @@ _MANAGER_ROUTING = (
     "compile-verify, and SAVE the code, then hand back a summary and file path. After it returns, give "
     "the user a brief summary and the saved path; do NOT re-paste the full code. Use web_search for "
     "current info, see_image for images, search_datasheets for quick hardware lookups. "
+    "For 'take me to / navigate / route to' requests, call show_route with LAT,LON coordinates "
+    "(clear_route takes it off the lens); there is no geocoder yet, so if you only have a street "
+    "address and no coordinates you trust, say so plainly instead of guessing. "
     "Before you tell the user a design is COMPLETE, call finalize_design with the file paths you are "
     "claiming — it verifies a board actually built and the files exist. Never report a design as done, "
     "and never report file paths, without a VERIFIED result from finalize_design."
@@ -1638,6 +1660,8 @@ TOOL_IMPLS = {
     "find_footprint": find_footprint,
     "part_pins": part_pins,
     "delegate_to_coder": delegate_to_coder,
+    "show_route": show_route,           # XORICS-FEATURE: nav-tool
+    "clear_route": clear_route,         # XORICS-FEATURE: nav-tool
 }
 
 
