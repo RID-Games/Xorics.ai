@@ -334,6 +334,47 @@ async def models():
     return {"object": "list", "data": [{"id": "xorics", "object": "model", "owned_by": "rid"}]}
 
 
+# --- permission surface ------------------------------------------------------
+# Privileged tools must be explicitly granted before xorics can use them. These
+# three routes let the dashboard (or curl) inspect and toggle the grant set
+# without going through a full chat turn. House auth pattern: each handler takes
+# request: Request and calls _auth(request) first, like the other direct routes.
+# _grant_tool / _is_privileged raise or return False for non-privileged names, so
+# we guard here too and return a clean 400 instead of letting an exception bubble.
+def _permissions_state():
+    return {
+        "privileged": sorted(xorics._PRIVILEGED_TOOLS),
+        "granted":    sorted(xorics._TOOL_GRANTS),
+    }
+
+
+@app.get("/v1/permissions")
+async def permissions(request: Request):
+    _auth(request)
+    return _permissions_state()
+
+
+@app.post("/v1/permissions/grant")
+async def permissions_grant(request: Request):
+    _auth(request)
+    body = await request.json()
+    name = body.get("tool") if isinstance(body, dict) else None
+    if not isinstance(name, str) or not xorics._grant_tool(name):
+        raise HTTPException(status_code=400, detail="not a privileged tool")
+    return _permissions_state()
+
+
+@app.post("/v1/permissions/revoke")
+async def permissions_revoke(request: Request):
+    _auth(request)
+    body = await request.json()
+    name = body.get("tool") if isinstance(body, dict) else None
+    if not isinstance(name, str) or not xorics._is_privileged(name):
+        raise HTTPException(status_code=400, detail="not a privileged tool")
+    xorics._revoke_tool(name)
+    return _permissions_state()
+
+
 _PAGE = """<!doctype html>
 <html lang="en">
 <head>
