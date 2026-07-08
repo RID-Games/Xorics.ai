@@ -1731,7 +1731,9 @@ def run_build(brain=None):
 
 def active_tools():
     # manual /code mode drives the coder directly; otherwise the manager delegates.
-    return CODER_TOOLS if BRAIN == CODER else MANAGER_TOOLS
+    if BRAIN == CODER:
+        return CODER_TOOLS
+    return MANAGER_TOOLS + [t for t in TOOLS if t["function"]["name"] in _PRIVILEGED_TOOLS and t not in MANAGER_TOOLS]  # XORICS-FEATURE: tool-permissions — schema exposure only, the chokepoint gate still denies until /grant.
 
 
 # ---- Conversation memory ------------------------------------------------------
