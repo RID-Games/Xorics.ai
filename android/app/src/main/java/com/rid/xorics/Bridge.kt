@@ -209,4 +209,57 @@ object Bridge {
             if (!r.isSuccessful) throw IOException("deleteFolder ${r.code}: ${r.body?.string().orEmpty().take(160)}")
         }
     }
+
+    // ================= permissions API (operator tool grants) ================
+    // Grants are PER-PROCESS and in-memory on the bridge: deny-all after every
+    // bridge restart. Never cache — render from a fresh GET on open/resume, and
+    // treat every POST response body as the new state (it is; no second GET).
+
+    data class Perms(val privileged: List<String>, val granted: List<String>)
+
+    private fun parsePerms(o: JSONObject): Perms {
+        fun names(key: String): List<String> {
+            val arr = o.getJSONArray(key)
+            val out = ArrayList<String>(arr.length())
+            for (i in 0 until arr.length()) out.add(arr.getString(i))
+            return out
+        }
+        return Perms(names("privileged"), names("granted"))
+    }
+
+    /** Current grant state: which tools are privileged, which are granted right now. */
+    fun getPermissions(): Perms {
+        val req = auth(Request.Builder().url("$BASE/v1/permissions")).get().build()
+        client.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("getPermissions ${r.code}: ${body.take(160)}")
+            return parsePerms(JSONObject(body))
+        }
+    }
+
+    /** Grant a privileged tool; returns the new state. 400 if not a privileged tool. */
+    fun grantTool(tool: String): Perms {
+        val payload = JSONObject().put("tool", tool)
+        val req = auth(Request.Builder().url("$BASE/v1/permissions/grant"))
+            .post(payload.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        client.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("grantTool ${r.code}: ${body.take(160)}")
+            return parsePerms(JSONObject(body))
+        }
+    }
+
+    /** Revoke a tool (idempotent on the server); returns the new state. 400 if not privileged. */
+    fun revokeTool(tool: String): Perms {
+        val payload = JSONObject().put("tool", tool)
+        val req = auth(Request.Builder().url("$BASE/v1/permissions/revoke"))
+            .post(payload.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        client.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("revokeTool ${r.code}: ${body.take(160)}")
+            return parsePerms(JSONObject(body))
+        }
+    }
 }

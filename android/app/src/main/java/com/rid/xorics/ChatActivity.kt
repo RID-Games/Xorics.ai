@@ -19,6 +19,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
@@ -32,6 +33,7 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -52,22 +54,53 @@ import kotlinx.coroutines.withContext
  * existing control panel (MainActivity), which is untouched.
  */
 class ChatActivity : ComponentActivity() {
+    // Bumped on every onResume so the screen re-fetches grant state. Grants are
+    // per-process on the bridge (deny-all after every restart) — never cache them
+    // across a pause/resume.
+    private val resumeTick = mutableIntStateOf(0)
+
+    override fun onResume() {
+        super.onResume()
+        resumeTick.intValue++
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 ChatScreen(
                     onOpenVoice = { startActivity(Intent(this, MainActivity::class.java)) },
-                    onOpenFiles = { startActivity(Intent(this, FilesActivity::class.java)) }
+                    onOpenFiles = { startActivity(Intent(this, FilesActivity::class.java)) },
+                    resumeTick = resumeTick.intValue
                 )
             }
         }
     }
 }
 
+// --- APP-B2: permission-card trigger ------------------------------------------
+// The gate's deny string (xorics.py _gate_privileged_call) is:
+//   PERMISSION REQUIRED: tool '<name>' needs an operator grant — ask the operator
+//   to run /grant <name>, then retry.
+// The manager relays in its own words and can paraphrase the marker away, so this
+// is best-effort by design: trigger on the marker or a "/grant <name>" mention,
+// and cover misses with the manual Grants button in the top bar.
+private val PERM_TOOL = Regex("tool '([^']+)'")
+private val PERM_GRANT = Regex("/grant ([A-Za-z0-9_]+)")
+
+/** Returns (this reply is asking for a grant, tool name if one could be extracted). */
+private fun permissionAsk(reply: String): Pair<Boolean, String?> {
+    val asked = reply.contains("PERMISSION REQUIRED", ignoreCase = true) ||
+        PERM_GRANT.containsMatchIn(reply)
+    if (!asked) return Pair(false, null)
+    val tool = PERM_TOOL.find(reply)?.groupValues?.get(1)
+        ?: PERM_GRANT.find(reply)?.groupValues?.get(1)
+    return Pair(true, tool)
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit) {
+fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val messages = remember { mutableStateListOf<Bridge.Msg>() }
@@ -76,6 +109,41 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit) {
     var status by remember { mutableStateOf("connecting…") }
     var chatId by remember { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
+
+    // Permission card state (APP-B2). perms is only ever what the bridge last said.
+    var perms by remember { mutableStateOf<Bridge.Perms?>(null) }
+    var showPerms by remember { mutableStateOf(false) }
+    var permHint by remember { mutableStateOf<String?>(null) }
+    var permStatus by remember { mutableStateOf("") }
+
+    fun refreshPerms() {
+        scope.launch {
+            try {
+                perms = withContext(Dispatchers.IO) { Bridge.getPermissions() }
+                permStatus = ""
+            } catch (e: Exception) {
+                permStatus = "error: ${e.message}"
+            }
+        }
+    }
+
+    /** Approve/Revoke. The POST response body IS the new state — no second GET. */
+    fun setGrant(tool: String, grant: Boolean) {
+        scope.launch {
+            try {
+                perms = withContext(Dispatchers.IO) {
+                    if (grant) Bridge.grantTool(tool) else Bridge.revokeTool(tool)
+                }
+                permStatus = ""
+            } catch (e: Exception) {
+                permStatus = "error: ${e.message}"
+            }
+        }
+    }
+
+    // Grants are per-process on the bridge, so re-fetch on open and on every
+    // resume rather than trusting anything cached.
+    LaunchedEffect(resumeTick) { refreshPerms() }
 
     // Load (or create) the persistent chat, then fetch its history.
     LaunchedEffect(Unit) {
@@ -111,6 +179,12 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit) {
                 val reply = withContext(Dispatchers.IO) { Bridge.sendMessage(id, text) }
                 messages.add(reply)
                 status = ""
+                val (asked, tool) = permissionAsk(reply.content)
+                if (asked) {
+                    permHint = tool
+                    showPerms = true
+                    refreshPerms()
+                }
             } catch (e: Exception) {
                 status = "error: ${e.message}"
             } finally {
@@ -125,6 +199,7 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit) {
             TopAppBar(
                 title = { Text("Xorics") },
                 actions = {
+                    TextButton(onClick = { permHint = null; showPerms = true; refreshPerms() }) { Text("Grants") }
                     TextButton(onClick = onOpenFiles) { Text("Files") }
                     TextButton(onClick = onOpenVoice) { Text("Voice") }
                 }
@@ -154,6 +229,18 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit) {
                 enabled = !sending && chatId != null
             )
         }
+    }
+
+    if (showPerms) {
+        PermissionsCard(
+            perms = perms,
+            hint = permHint,
+            status = permStatus,
+            onGrant = { setGrant(it, true) },
+            onRevoke = { setGrant(it, false) },
+            onRefresh = { refreshPerms() },
+            onClose = { showPerms = false; permHint = null }
+        )
     }
 }
 
@@ -202,4 +289,72 @@ fun InputBar(value: String, onValue: (String) -> Unit, onSend: () -> Unit, enabl
             }
         }
     }
+}
+
+/**
+ * Operator grant card (APP-B2). Renders only what the bridge reports: privileged
+ * tools with their current grant state, Approve to grant, Revoke to drop. Every
+ * state shown is the bridge's latest response body, never a cache.
+ */
+@Composable
+fun PermissionsCard(
+    perms: Bridge.Perms?,
+    hint: String?,
+    status: String,
+    onGrant: (String) -> Unit,
+    onRevoke: (String) -> Unit,
+    onRefresh: () -> Unit,
+    onClose: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("Tool permissions") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (hint != null) {
+                    Text(
+                        "Xorics is asking for '$hint'.",
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+                when {
+                    perms == null -> Text("loading…")
+                    perms.privileged.isEmpty() -> Text("no privileged tools")
+                    else -> perms.privileged.forEach { tool ->
+                        val granted = tool in perms.granted
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(tool)
+                                Text(
+                                    if (granted) "granted" else "denied",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                            if (granted) {
+                                TextButton(onClick = { onRevoke(tool) }) { Text("Revoke") }
+                            } else {
+                                Button(onClick = { onGrant(tool) }) { Text("Approve") }
+                            }
+                        }
+                    }
+                }
+                Text(
+                    "Per bridge process — deny-all after every bridge restart.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                if (status.isNotEmpty()) {
+                    Text(
+                        status,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onClose) { Text("Close") } },
+        dismissButton = { TextButton(onClick = onRefresh) { Text("Refresh") } }
+    )
 }
