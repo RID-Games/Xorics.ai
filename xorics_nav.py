@@ -16,13 +16,26 @@ Increment 2 — active route: show_route / clear_route are the manager's tool
 surface (registered in xorics.py). show_route validates coordinates, routes,
 and persists the route via save_active_route to state/nav_route.json;
 dashboard_router's Nav page reads that file on every fetch, so a voice ask
-lands on the lens immediately and survives a bridge restart. Coordinates only
-until the geocoder (§3.B) and GPS-origin (§3.C) increments land.
+lands on the lens immediately and survives a bridge restart.
+
+Increment 3 — geocoder (§3.B): geocode() resolves street addresses through
+the self-hosted Nominatim on RIDGames (:8088; Wisconsin extract + WI TIGER
+house-number interpolation, so rural addresses resolve). Proven failure mode
+baked into the design: Nominatim parents roads under the locality IT chose
+("3697 Wildcat Trail, New Franken" -> [] because that road files under Green
+Bay), so lookups walk a fallback ladder — full string first, then drop
+trailing comma-segments until something matches. The tool string reports
+WHAT matched so the user hears the resolved place before anything routes;
+the manager chains the coordinates into show_route. GPS (§3.C) still pending.
 
 Usage:
     python3 xorics_nav.py selftest
         Offline oracle: formats an embedded GraphHopper fixture, asserts
         layout invariants. No network, no glasses. Exits 0 on OK.
+
+    python3 xorics_nav.py geocode ADDRESS...
+        Live probe: resolve a street address via the local Nominatim and
+        print the exact tool string (needs `nominatim serve` on :8088).
 
     python3 xorics_nav.py LAT,LON LAT,LON [LAT,LON ...]
         Fetch a car route from GraphHopper and print every HUD block to the
@@ -35,6 +48,7 @@ Usage:
 
 Env:
     XORICS_GH_URL       GraphHopper base URL   (default http://127.0.0.1:8989)
+    XORICS_NOMINATIM_URL  Nominatim base URL   (default http://127.0.0.1:8088)
     XORICS_NAV_UNITS    "mi" (default) or "km"
     XORICS_BRIDGE_URL   passed through to xorics_glasses for --hud
 
@@ -55,6 +69,8 @@ import urllib.parse
 import urllib.request
 
 GH_URL = os.environ.get("XORICS_GH_URL", "http://127.0.0.1:8989").rstrip("/")
+NOMINATIM_URL = os.environ.get("XORICS_NOMINATIM_URL",
+                               "http://127.0.0.1:8088").rstrip("/")
 UNITS = os.environ.get("XORICS_NAV_UNITS", "mi")
 
 MANEUVER_MAX = 50  # chars; device wraps at 25, so <= 2 rendered lines
@@ -160,6 +176,55 @@ def parse_point(s):
     return lat, lon
 
 
+# --------------------------------------------------- geocoder (increment 3)
+
+def _nominatim_search(q):
+    """One Nominatim /search call -> list of raw result dicts.
+
+    Transport failures raise SystemExit (module CLI idiom, same contract as
+    route()); an empty list is a legitimate "no match" answer, not an error.
+    Swapped out wholesale by selftest so the fallback ladder is testable
+    without a server. XORICS-FEATURE: nav-tool"""
+    url = (NOMINATIM_URL + "/search?" +
+           urllib.parse.urlencode([("q", q), ("format", "jsonv2"),
+                                   ("limit", "1")]))
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.URLError as e:
+        raise SystemExit(
+            "Can't reach Nominatim at %s (%s) — is `nominatim serve` running?"
+            % (NOMINATIM_URL, getattr(e, "reason", e)))
+    except ValueError:
+        raise SystemExit("Nominatim at %s returned non-JSON — wrong service "
+                         "on that port?" % NOMINATIM_URL)
+
+
+def geocode_lookup(address):
+    """Resolve a street address via the local Nominatim -> dict or None.
+
+    Fallback ladder for the locality-veto failure mode proven on hardware
+    (2026-07-08: "3697 Wildcat Trail, New Franken" -> [] while
+    "3697 Wildcat Trail" -> the TIGER-interpolated house, because Nominatim
+    parents that road under Green Bay): try the full string, then keep
+    dropping the last comma-segment until something matches or nothing is
+    left. Returns {"lat","lon","matched","addresstype","query_used"} on a
+    hit, None if every rung missed. Transport failures raise SystemExit."""
+    q = " ".join(str(address).split())
+    while q:
+        hits = _nominatim_search(q)
+        if hits:
+            h = hits[0]
+            return {"lat": float(h["lat"]), "lon": float(h["lon"]),
+                    "matched": h.get("display_name", "?"),
+                    "addresstype": h.get("addresstype", "?"),
+                    "query_used": q}
+        if "," not in q:
+            return None
+        q = q.rsplit(",", 1)[0].strip()
+    return None
+
+
 # ------------------------------------------------- active route (increment 2)
 # The manager-set route the dash Nav page displays. Written by the show_route
 # tool below, read by dashboard_router._nav_lines on every page fetch — so a
@@ -222,9 +287,9 @@ def clear_active_route():
 def show_route(destination, origin=None, label=None):
     """Manager tool: compute a car route and put it on the glasses Nav page.
 
-    Coordinates only ("LAT,LON") — there is no geocoder (§3.B) and no GPS
-    (§3.C) yet, so a missing `origin` falls back to the first point of
-    DEFAULT_ROUTE_SPEC and the result says so. Always returns a plain string:
+    Coordinates only ("LAT,LON") by design — street addresses go through the
+    geocode tool first (§3.B), and with no GPS (§3.C) yet a missing `origin`
+    falls back to the first point of DEFAULT_ROUTE_SPEC and the result says so. Always returns a plain string:
     every failure (bad point, GraphHopper down, point outside the loaded map)
     is caught HERE — including this module's SystemExit CLI idiom, which the
     xorics.py agent loop does NOT catch (`except Exception` misses it) and
@@ -246,8 +311,8 @@ def show_route(destination, origin=None, label=None):
         save_active_route(spec, label=label)
     except SystemExit as e:
         return ("[nav error: %s] — pass coordinates as 'LAT,LON' inside the "
-                "loaded map region; if you only have a street address, say you "
-                "can't geocode yet instead of guessing." % e)
+                "loaded map region; if you only have a street address, call "
+                "geocode first and use the coordinates it returns." % e)
     except Exception as e:  # pragma: no cover — belt for non-CLI failures
         return "[nav error: %s: %s]" % (type(e).__name__, e)
     first = blocks[0].split("\n")[0] if blocks else "(no instructions)"
@@ -263,6 +328,37 @@ def clear_route():
     return ("Route cleared — the Nav page is back on its default route."
             if clear_active_route() else
             "No active route was set; the Nav page is already on its default route.")
+
+
+def geocode(address):
+    """Manager tool: street address -> coordinates via the local Nominatim.
+
+    Always returns a plain string (same contract as show_route: this module's
+    SystemExit idiom must not escape into the xorics.py agent loop). On a hit
+    the string leads with LAT,LON and echoes Nominatim's matched display_name,
+    so the resolved place is visible BEFORE anything routes — the tool never
+    invents coordinates, it only relays what the geocoder returned; on a miss
+    it says so and tells the manager not to guess. XORICS-FEATURE: nav-tool"""
+    a = " ".join(str(address).split())
+    if not a:
+        return "[geocode error: empty address]"
+    try:
+        hit = geocode_lookup(a)
+    except SystemExit as e:
+        return "[geocode error: %s]" % e
+    except Exception as e:  # pragma: no cover — belt for non-CLI failures
+        return "[geocode error: %s: %s]" % (type(e).__name__, e)
+    if hit is None:
+        return ("NO MATCH for %r in the local index (Wisconsin + TIGER house "
+                "numbers). Tell the user the address didn't resolve — do NOT "
+                "guess coordinates and do NOT route anywhere." % a)
+    coords = "%.7f,%.7f" % (hit["lat"], hit["lon"])
+    note = ("." if hit["query_used"] == a else
+            " [full string had no match; matched after dropping the locality "
+            "— read the town in the match back to the user].")
+    return ("GEOCODED %r -> %s (%s: %s)%s Chain into show_route with "
+            "destination='%s' and a short label from the user's words."
+            % (a, coords, hit["addresstype"], hit["matched"], note, coords))
 
 
 # ---------------------------------------------------------------- selftest
@@ -354,6 +450,46 @@ def selftest():
     finally:
         ACTIVE_ROUTE_PATH = _orig_path
 
+    # Geocode fallback ladder (increment 3) — hermetic: the Nominatim call is
+    # swapped for a canned table, so no server is needed and what's under test
+    # is the ladder itself (full string first, then drop comma-segments) plus
+    # the honesty framing of the tool strings.
+    global _nominatim_search
+    _orig_search = _nominatim_search
+    try:
+        canned = {"3697 Wildcat Trail": [{
+            "lat": "44.5228557", "lon": "-87.8977403",
+            "display_name": "3697, Wildcat Trail, Green Bay, Brown County, "
+                            "Wisconsin, 54229, United States",
+            "addresstype": "place"}]}
+        calls = []
+
+        def _fake(q):
+            calls.append(q)
+            return canned.get(q, [])
+
+        _nominatim_search = _fake
+        hit = geocode_lookup("3697 Wildcat Trail, New Franken")
+        check("ladder hit", hit is not None, True)
+        check("ladder coords", "%.4f" % (hit or {}).get("lat", 0.0), "44.5229")
+        check("ladder query used", (hit or {}).get("query_used"),
+              "3697 Wildcat Trail")
+        check("ladder order", calls,
+              ["3697 Wildcat Trail, New Franken", "3697 Wildcat Trail"])
+        check("ladder miss is None", geocode_lookup("nowhere at all"), None)
+        msg = geocode("3697 Wildcat Trail, New Franken")
+        check("tool coords in msg", "44.5228557,-87.8977403" in msg, True)
+        check("tool locality note", "dropping the locality" in msg, True)
+        msg2 = geocode("3697 Wildcat Trail")
+        check("tool no note on exact hit", "dropping the locality" in msg2,
+              False)
+        msg3 = geocode("nowhere at all")
+        check("tool no-match honesty", "do NOT guess" in msg3, True)
+        check("tool empty address", geocode("  "),
+              "[geocode error: empty address]")
+    finally:
+        _nominatim_search = _orig_search
+
     print("SELFTEST OK" if ok else "SELFTEST FAILED")
     return 0 if ok else 1
 
@@ -363,6 +499,10 @@ def selftest():
 def main(argv):
     if len(argv) >= 1 and argv[0] == "selftest":
         return selftest()
+
+    if len(argv) >= 2 and argv[0] == "geocode":
+        print(geocode(" ".join(argv[1:])))
+        return 0
 
     hud = "--hud" in argv
     pts = [parse_point(a) for a in argv if a != "--hud"]
