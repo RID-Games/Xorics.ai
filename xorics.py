@@ -838,6 +838,8 @@ _RESEARCH_TOOLS = {"web_search", "search_datasheets", "fetch_datasheet",
 # source) so the coder physically can't keep researching. find_part / find_footprint / part_pins
 # stay, since those return VERIFIED parts it needs to actually write. XORICS-FEATURE: convergence-guard
 _SOFT_RESEARCH_TOOLS = {"web_search", "search_datasheets", "fetch_datasheet"}
+# Privileged tools the manager may only call behind an explicit operator grant — deny-all default, enforcement comes later at the exec chokepoint. XORICS-FEATURE: tool-permissions
+_PRIVILEGED_TOOLS = {"write_file", "str_replace"}
 _CONVERGENCE_NUDGE = (
     "\n\n⛔ CONVERGENCE — you have run {n} look-ups without validating a circuit. You already have the "
     "parts you need; find_part returns VERIFIED parts, so STOP searching. In your NEXT message write a "
@@ -1514,6 +1516,34 @@ _PLANNER_GUIDE = (
 # spec without reading anything is caught too. XORICS-FEATURE: design-mode
 _DESIGN_SPEC_MARKER = "=== SELF-EDIT SPEC ==="
 _LAST_DESIGN_SPEC = None
+_TOOL_GRANTS = set()  # operator grants, deny-all default. XORICS-FEATURE: tool-permissions
+
+
+def _is_privileged(name):
+    """True if `name` is in _PRIVILEGED_TOOLS (writes/edits to Xorics's own repo)."""
+    return name in _PRIVILEGED_TOOLS
+
+
+def _is_granted(name):
+    """True if `name` has been granted by the operator (always False on a deny-all default)."""
+    return name in _TOOL_GRANTS
+
+
+def _grant_tool(name):
+    """Grant the operator's permission to call `name`. Refuses non-privileged names; returns
+    True on a real grant, False otherwise."""
+    if not _is_privileged(name):
+        return False
+    _TOOL_GRANTS.add(name)
+    return True
+
+
+def _revoke_tool(name):
+    """Revoke the operator's grant for `name`. Returns True if it WAS granted, False otherwise."""
+    if name in _TOOL_GRANTS:
+        _TOOL_GRANTS.discard(name)
+        return True
+    return False
 
 
 def _design_files_read(messages):
