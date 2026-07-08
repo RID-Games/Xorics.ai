@@ -289,7 +289,7 @@ _SELFEDIT_VERIFY_CMD = "./run_tests.sh"   # FIXED — the model never chooses ho
 # heavy / host-specific dirs. sandbox.run() then makes its OWN lean copy for the
 # container (its default ignore drops .git too), so the suite still runs fast.
 _SELFEDIT_STAGE_IGNORE = ("venv", "skidl-venv", ".venv", "__pycache__",
-                          ".mypy_cache", ".pytest_cache", "node_modules", "*.pyc")
+                          ".mypy_cache", ".pytest_cache", "node_modules", "*.pyc", "*.log")
 
 
 def _selfedit_image():
@@ -1211,6 +1211,8 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
                                for k, v in args.items()}
                     print(f"  [{tag}→{name}]({preview})")
                     gate = notebook.gate(name, args) if notebook else None  # XORICS-FEATURE: dedup guard
+                    if gate is None:
+                        gate = _gate_privileged_call(name, tag)  # XORICS-FEATURE: tool-permissions
                     if gate is not None:
                         result = gate  # cached echo / hard refusal; impl NOT called
                     else:
@@ -1544,6 +1546,15 @@ def _revoke_tool(name):
         _TOOL_GRANTS.discard(name)
         return True
     return False
+
+
+def _gate_privileged_call(name, tag):
+    """XORICS-FEATURE: tool-permissions: refuse an ungranted privileged call; None means 'proceed'."""
+    if tag == "selfedit":
+        return None                                              # operator-initiated self-edit runs are exempt — /promote stays the landing gate
+    if not _is_privileged(name) or _is_granted(name):
+        return None
+    return "PERMISSION REQUIRED: tool '" + name + "' needs an operator grant — ask the operator to run /grant " + name + ", then retry."
 
 
 def _design_files_read(messages):
@@ -1902,7 +1913,7 @@ if __name__ == "__main__":
         sys.exit()
 
     print(f"{NAME} — local AI. The manager delegates coding to the coder automatically.")
-    print("commands: /code (coder)  /selfedit (edit Xorics, sandbox-verified; /power first → drive on M3)  /design (plan one change, read-only)  /build (run /selfedit on the last /design spec)  /plan (break a feature into small bricks; /power for M3)  /promote /discard (approve or drop a self-edit)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
+    print("commands: /code (coder)  /selfedit (edit Xorics, sandbox-verified; /power first → drive on M3)  /design (plan one change, read-only)  /build (run /selfedit on the last /design spec)  /plan (break a feature into small bricks; /power for M3)  /promote /discard (approve or drop a self-edit)  /grant /revoke /grants (privileged tool permissions)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
     print(f"coder pauses every {CHECKPOINT_EVERY} steps to check in (no cap); backstop {CODER_BACKSTOP} when unattended.\n")
     if _CHAT_HISTORY:
         print(f"(resumed {len(_CHAT_HISTORY)} remembered messages — /reset to start fresh)\n")
@@ -1983,6 +1994,26 @@ if __name__ == "__main__":
                       "prints a PLAN + self-edit spec, makes NO edits and stops)\n")
                 ans = run_design(goal, brain=driver)
                 print(f"\n{NAME.lower()}>", ans, "\n")
+                continue
+            elif q == "/grants":     # XORICS-FEATURE: tool-permissions
+                print("privileged: " + ", ".join(sorted(_PRIVILEGED_TOOLS)))
+                granted = ", ".join(sorted(_TOOL_GRANTS)) if _TOOL_GRANTS else "(none — deny-all)"
+                print("granted: " + granted)
+                print()
+                continue
+            elif q.startswith("/grant "):   # XORICS-FEATURE: tool-permissions
+                t = q[7:].strip()
+                if _grant_tool(t):
+                    print(f"granted: {t} (revoke with /revoke {t})")
+                else:
+                    print(f"refused: {t} is not a privileged tool — grantable: "
+                          + ", ".join(sorted(_PRIVILEGED_TOOLS)))
+                print()
+                continue
+            elif q.startswith("/revoke "):   # XORICS-FEATURE: tool-permissions
+                t = q[8:].strip()
+                print(f"revoked: {t}" if _revoke_tool(t) else f"{t} was not granted")
+                print()
                 continue
             elif q == "/promote" or q.startswith("/promote "):   # XORICS-FEATURE: self-edit (approval gate)
                 msg = q[8:].strip() or None
