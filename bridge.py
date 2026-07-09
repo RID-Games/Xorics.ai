@@ -375,6 +375,63 @@ async def permissions_revoke(request: Request):
     return _permissions_state()
 
 
+# --- operator self-edit review surface --------------------------------------
+# Deliberate human approval gate: nothing may ever call promote or discard
+# except these operator-invoked routes, and the diff is shown to the operator
+# (GET) before promote. Promote and discard hold _ASK_LOCK so they never race an
+# in-flight ask() that is still staging edits.
+def _selfedit_state():
+    rels, diff, task = xorics.review_self_edit()
+    return {"files": rels, "diff": diff, "task": task}
+
+
+@app.get("/v1/selfedit")
+async def selfedit_review(request: Request):
+    _auth(request)
+    return await run_in_threadpool(_selfedit_state)
+
+
+def _selfedit_promote(message, push):
+    with _ASK_LOCK:
+        status = xorics.promote_self_edit(message=message)
+        if push and status.startswith("PROMOTED"):
+            p = subprocess.run(
+                ["git", "-C", xorics.REPO_ROOT, "push", "origin"],
+                capture_output=True,
+                text=True,
+                env=dict(os.environ, GIT_TERMINAL_PROMPT="0"),
+            )
+            status += ("\nPUSHED: " if p.returncode == 0 else "\nPUSH FAILED: ") + (
+                p.stderr or p.stdout or ""
+            ).strip()
+        state = _selfedit_state()
+        state["status"] = status
+        return state
+
+
+@app.post("/v1/selfedit/promote")
+async def selfedit_promote(request: Request):
+    _auth(request)
+    body = await request.json()
+    message = body.get("message") if isinstance(body, dict) and isinstance(body.get("message"), str) else None
+    push = bool(body.get("push")) if isinstance(body, dict) else False
+    return await run_in_threadpool(_selfedit_promote, message, push)
+
+
+def _selfedit_discard():
+    with _ASK_LOCK:
+        status = xorics.discard_self_edit()
+        state = _selfedit_state()
+        state["status"] = status
+        return state
+
+
+@app.post("/v1/selfedit/discard")
+async def selfedit_discard(request: Request):
+    _auth(request)
+    return await run_in_threadpool(_selfedit_discard)
+
+
 _PAGE = """<!doctype html>
 <html lang="en">
 <head>
