@@ -288,8 +288,13 @@ _SELFEDIT_VERIFY_CMD = "./run_tests.sh"   # FIXED — the model never chooses ho
 # Stage the live tree but KEEP .git (Brick C's promotion needs it) while dropping the
 # heavy / host-specific dirs. sandbox.run() then makes its OWN lean copy for the
 # container (its default ignore drops .git too), so the suite still runs fast.
-_SELFEDIT_STAGE_IGNORE = ("venv", "skidl-venv", ".venv", "__pycache__",
-                          ".mypy_cache", ".pytest_cache", "node_modules", "*.pyc", "*.log")
+_SELFEDIT_STAGE_IGNORE = (".venv", "venv", "skidl-venv", "__pycache__", ".mypy_cache", ".pytest_cache",
+                          "node_modules", ".git",
+                          "data", "state", "inbox", "android", "android.bak-*",
+                          "*.pyc", "*.log", "*.bak", "*.bak-*",
+                          "hermes-runtime", "nominatim", "nominatim-venv",
+                          "sketches", "notebooks", "circuits", "rag_index", "nav",
+                          "llama-swap.yaml", "datasheets")
 
 
 def _selfedit_image():
@@ -489,7 +494,21 @@ def _selfedit_changed_files():
                 new = open(ab, "rb").read()
             except OSError:
                 continue
-            if (not os.path.exists(live_abs)) or open(live_abs, "rb").read() != new:
+            # Skip binary files entirely — they cannot be promoted cleanly (git would treat
+            # them as blobs, review would render as gibberish, and a model reading the diff
+            # would still see NULs). They never appear in `_selfedit_diff` either via the
+            # (binary file) check, so this keeps workspace vs live comparison consistent.
+            if b"\x00" in new:
+                continue
+            try:
+                live_bytes = open(live_abs, "rb").read() if os.path.exists(live_abs) else None
+            except OSError:
+                continue
+            if live_bytes is not None and b"\x00" in live_bytes:
+                # The live file is already binary (e.g. a bundled asset); the workspace copy
+            # likewise has no textual diff to evaluate, so leave this file alone too.
+                continue
+            if (live_bytes is None) or live_bytes != new:
                 out.append(rel)
     return sorted(out)
 

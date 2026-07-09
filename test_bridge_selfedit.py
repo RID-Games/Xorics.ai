@@ -87,6 +87,29 @@ try:
     check("POST discard twice: nothing-pending message",
           "Nothing pending" in r.json().get("status", ""))
 
+    # ---- stage a BINARY file (NUL bytes): review must never crash -------------
+    # The current request re-creates the throwaway workspace from the discard above,
+    # so we recreate `work/` here too.
+    os.makedirs(work, exist_ok=True)
+    bin_name = "BINARY-PROBE.bin"
+    with open(os.path.join(work, bin_name), "wb") as f:
+        f.write(b"\x00\x01\x02NUL-MID\x00\xff\xfe")
+    try:
+        r = c.get("/v1/selfedit")
+        body = r.json() if r.status_code == 200 else {}
+        # Either filtered out, or rendered as the safe placeholder — never a 500,
+        # never an unhandled traceback. Binary bytes must NOT leak into the diff.
+        diff_text = body.get("diff", "")
+        files_text = ",".join(body.get("files") or [])
+        check("GET binary: 200 (no crash)",     r.status_code == 200)
+        check("GET binary: filtered or marked",
+              bin_name not in files_text or "binary" in diff_text.lower())
+        check("GET binary: no raw NUL in diff",  b"\x00" not in diff_text.encode("utf-8", "replace"))
+    finally:
+        # Always clean the binary probe so the test is hermetic on re-runs.
+        try: os.remove(os.path.join(work, bin_name))
+        except OSError: pass
+
 finally:
     sandbox.container_runtime = _real_runtime
     shutil.rmtree(_TMP, ignore_errors=True)
