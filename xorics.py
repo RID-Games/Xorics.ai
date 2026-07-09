@@ -290,7 +290,8 @@ _SELFEDIT_VERIFY_CMD = "./run_tests.sh"   # FIXED — the model never chooses ho
 # container (its default ignore drops .git too), so the suite still runs fast.
 _SELFEDIT_STAGE_IGNORE = (".venv", "venv", "skidl-venv", "__pycache__", ".mypy_cache", ".pytest_cache",
                           "node_modules", ".git",
-                          "data", "state", "inbox", "android", "android.bak-*",
+                          "data", "state", "inbox", "android.bak-*",
+                          "build", ".gradle", "*.apk", "*.jar",
                           "*.pyc", "*.log", "*.bak", "*.bak-*",
                           "hermes-runtime", "nominatim", "nominatim-venv",
                           "sketches", "notebooks", "circuits", "rag_index", "nav",

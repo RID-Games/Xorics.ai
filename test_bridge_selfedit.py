@@ -114,5 +114,22 @@ finally:
     sandbox.container_runtime = _real_runtime
     shutil.rmtree(_TMP, ignore_errors=True)
 
+# ---- _SELFEDIT_STAGE_IGNORE contents -----------------------------------------
+# android Kotlin sources must stage into the workspace, but build outputs, gradle
+# caches, and binary archives stay excluded; android.bak-* is still ignored.
+_ignore = xorics._SELFEDIT_STAGE_IGNORE
+check("ignore: 'android' is no longer excluded",
+      "android" not in _ignore)
+check("ignore: 'android.bak-*' is still excluded",
+      "android.bak-*" in _ignore)
+check("ignore: 'build' is now excluded",
+      "build" in _ignore)
+check("ignore: '.gradle' is now excluded",
+      ".gradle" in _ignore)
+check("ignore: '*.apk' is now excluded",
+      "*.apk" in _ignore)
+check("ignore: '*.jar' is now excluded",
+      "*.jar" in _ignore)
+
 print(f"\n{_pass} passed, {_fail} failed")
 raise SystemExit(1 if _fail else 0)
