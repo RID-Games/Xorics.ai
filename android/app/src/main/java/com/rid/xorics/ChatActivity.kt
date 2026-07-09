@@ -25,9 +25,15 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -139,6 +145,7 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
     var sending by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("connecting…") }
     var chatId by remember { mutableStateOf<String?>(null) }
+    var menuOpen by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
 
     // Permission card state (APP-B2). perms is only ever what the bridge last said.
@@ -370,10 +377,30 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
             TopAppBar(
                 title = { Text("Xorics") },
                 actions = {
-                    TextButton(onClick = { showEdits = true; refreshEdits() }) { Text("Edits") }
-                    TextButton(onClick = { permHint = null; showPerms = true; refreshPerms() }) { Text("Grants") }
-                    TextButton(onClick = onOpenFiles) { Text("Files") }
-                    TextButton(onClick = onOpenVoice) { Text("Voice") }
+                    IconButton(onClick = { menuOpen = true }) {
+                        Icon(Icons.Default.Menu, contentDescription = "Menu")
+                    }
+                    DropdownMenu(
+                        expanded = menuOpen,
+                        onDismissRequest = { menuOpen = false }
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("Edits") },
+                            onClick = { menuOpen = false; showEdits = true; refreshEdits() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Grants") },
+                            onClick = { menuOpen = false; permHint = null; showPerms = true; refreshPerms() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Files") },
+                            onClick = { menuOpen = false; onOpenFiles() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Voice") },
+                            onClick = { menuOpen = false; onOpenVoice() }
+                        )
+                    }
                 }
             )
         }
