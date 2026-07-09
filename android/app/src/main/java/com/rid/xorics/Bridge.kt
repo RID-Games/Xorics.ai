@@ -27,6 +27,13 @@ object Bridge {
         .readTimeout(120, TimeUnit.SECONDS)
         .build()
 
+    // Promote re-verifies the whole suite in the sandbox server-side before it
+    // touches the live tree — that alone can exceed the 120s default. Share the
+    // pool, stretch only the read timeout.
+    private val slowClient = client.newBuilder()
+        .readTimeout(600, TimeUnit.SECONDS)
+        .build()
+
     private fun auth(b: Request.Builder) = b.addHeader("Authorization", "Bearer $TOKEN")
 
     /** One turn in a conversation. */
@@ -260,6 +267,71 @@ object Bridge {
             val body = r.body?.string().orEmpty()
             if (!r.isSuccessful) throw IOException("revokeTool ${r.code}: ${body.take(160)}")
             return parsePerms(JSONObject(body))
+        }
+    }
+
+    // ================= self-edit API (review / promote / discard) ============
+    // APP-B3: the deliberate human gate on the front half of the self-improvement
+    // loop. GET shows what a self-edit staged; NOTHING lands until the operator
+    // explicitly promotes — and the server re-verifies in the sandbox before it
+    // touches the live tree. Every POST response body IS the new state (it is;
+    // no second GET), same contract as the permissions API above.
+
+    data class SelfEdit(
+        val files: List<String>,
+        val diff: String,
+        val task: String,
+        val status: String?
+    )
+
+    private fun parseSelfEdit(o: JSONObject): SelfEdit {
+        val arr = o.getJSONArray("files")
+        val files = ArrayList<String>(arr.length())
+        for (i in 0 until arr.length()) files.add(arr.getString(i))
+        return SelfEdit(
+            files,
+            o.optString("diff"),
+            o.optString("task"),
+            if (o.has("status")) o.getString("status") else null
+        )
+    }
+
+    /** What's pending for promotion right now: changed files, unified diff, task. */
+    fun getSelfEdit(): SelfEdit {
+        val req = auth(Request.Builder().url("$BASE/v1/selfedit")).get().build()
+        client.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("getSelfEdit ${r.code}: ${body.take(160)}")
+            return parseSelfEdit(JSONObject(body))
+        }
+    }
+
+    /**
+     * Promote the pending self-edit: the server re-verifies it in the sandbox,
+     * copies it into the live tree, commits — and pushes when `push` is true.
+     * Slow by nature (the re-verify runs the whole suite), hence slowClient.
+     */
+    fun promoteSelfEdit(push: Boolean): SelfEdit {
+        val payload = JSONObject().put("push", push)
+        val req = auth(Request.Builder().url("$BASE/v1/selfedit/promote"))
+            .post(payload.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        slowClient.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("promoteSelfEdit ${r.code}: ${body.take(160)}")
+            return parseSelfEdit(JSONObject(body))
+        }
+    }
+
+    /** Throw the pending self-edit away; the live tree is untouched. */
+    fun discardSelfEdit(): SelfEdit {
+        val req = auth(Request.Builder().url("$BASE/v1/selfedit/discard"))
+            .post("{}".toRequestBody("application/json".toMediaType()))
+            .build()
+        client.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("discardSelfEdit ${r.code}: ${body.take(160)}")
+            return parseSelfEdit(JSONObject(body))
         }
     }
 }

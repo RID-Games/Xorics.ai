@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -12,13 +13,16 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -42,6 +46,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -141,6 +146,45 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
         }
     }
 
+    // Self-edit review card state (APP-B3). selfEdit is only ever what the bridge
+    // last said. The card is the human gate: the diff gets READ here, and promote
+    // or discard only fire on an explicit (armed) operator tap — never automatically.
+    var selfEdit by remember { mutableStateOf<Bridge.SelfEdit?>(null) }
+    var showEdits by remember { mutableStateOf(false) }
+    var editsBusy by remember { mutableStateOf(false) }
+    var editsStatus by remember { mutableStateOf("") }
+
+    fun refreshEdits() {
+        scope.launch {
+            try {
+                selfEdit = withContext(Dispatchers.IO) { Bridge.getSelfEdit() }
+                editsStatus = ""
+            } catch (e: Exception) {
+                editsStatus = "error: ${e.message}"
+            }
+        }
+    }
+
+    /** Promote or discard. The POST response body IS the new state — no second GET. */
+    fun resolveEdits(promote: Boolean) {
+        if (editsBusy) return
+        editsBusy = true
+        editsStatus = if (promote) "promoting — sandbox re-verify runs first, this takes a while…"
+                      else "discarding…"
+        scope.launch {
+            try {
+                selfEdit = withContext(Dispatchers.IO) {
+                    if (promote) Bridge.promoteSelfEdit(push = true) else Bridge.discardSelfEdit()
+                }
+                editsStatus = selfEdit?.status ?: ""
+            } catch (e: Exception) {
+                editsStatus = "error: ${e.message}"
+            } finally {
+                editsBusy = false
+            }
+        }
+    }
+
     // Grants are per-process on the bridge, so re-fetch on open and on every
     // resume rather than trusting anything cached.
     LaunchedEffect(resumeTick) { refreshPerms() }
@@ -199,6 +243,7 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
             TopAppBar(
                 title = { Text("Xorics") },
                 actions = {
+                    TextButton(onClick = { showEdits = true; refreshEdits() }) { Text("Edits") }
                     TextButton(onClick = { permHint = null; showPerms = true; refreshPerms() }) { Text("Grants") }
                     TextButton(onClick = onOpenFiles) { Text("Files") }
                     TextButton(onClick = onOpenVoice) { Text("Voice") }
@@ -240,6 +285,18 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
             onRevoke = { setGrant(it, false) },
             onRefresh = { refreshPerms() },
             onClose = { showPerms = false; permHint = null }
+        )
+    }
+
+    if (showEdits) {
+        SelfEditCard(
+            edit = selfEdit,
+            busy = editsBusy,
+            status = editsStatus,
+            onPromote = { resolveEdits(promote = true) },
+            onDiscard = { resolveEdits(promote = false) },
+            onRefresh = { refreshEdits() },
+            onClose = { showEdits = false }
         )
     }
 }
@@ -356,5 +413,86 @@ fun PermissionsCard(
         },
         confirmButton = { TextButton(onClick = onClose) { Text("Close") } },
         dismissButton = { TextButton(onClick = onRefresh) { Text("Refresh") } }
+    )
+}
+
+/**
+ * Self-edit review card (APP-B3): the deliberate human gate on the front half of
+ * the self-improvement loop. The operator READS the diff here, then explicitly
+ * promotes (server re-verifies in the sandbox, commits, pushes) or discards.
+ * Both destructive actions are armed behind a second tap; nothing auto-promotes.
+ */
+@Composable
+fun SelfEditCard(
+    edit: Bridge.SelfEdit?,
+    busy: Boolean,
+    status: String,
+    onPromote: () -> Unit,
+    onDiscard: () -> Unit,
+    onRefresh: () -> Unit,
+    onClose: () -> Unit
+) {
+    // "promote" | "discard" | null — the first tap arms, the second fires.
+    var arm by remember { mutableStateOf<String?>(null) }
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("Pending self-edit") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                when {
+                    edit == null -> Text("loading…")
+                    edit.files.isEmpty() ->
+                        Text("nothing pending — the workspace matches the live tree")
+                    else -> {
+                        if (edit.task.isNotEmpty()) {
+                            Text("Task: ${edit.task}", style = MaterialTheme.typography.bodySmall)
+                        }
+                        Text(
+                            edit.files.joinToString("\n"),
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            edit.diff,
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier
+                                .heightIn(max = 260.dp)
+                                .verticalScroll(rememberScrollState())
+                                .horizontalScroll(rememberScrollState())
+                        )
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            if (arm == "discard") {
+                                Button(onClick = { arm = null; onDiscard() }, enabled = !busy) {
+                                    Text("Confirm discard")
+                                }
+                            } else {
+                                TextButton(onClick = { arm = "discard" }, enabled = !busy) {
+                                    Text("Discard")
+                                }
+                            }
+                            if (arm == "promote") {
+                                Button(onClick = { arm = null; onPromote() }, enabled = !busy) {
+                                    Text("Confirm promote")
+                                }
+                            } else {
+                                TextButton(onClick = { arm = "promote" }, enabled = !busy) {
+                                    Text("Promote + push")
+                                }
+                            }
+                        }
+                    }
+                }
+                if (status.isNotEmpty()) {
+                    Text(status, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onClose) { Text("Close") } },
+        dismissButton = {
+            TextButton(onClick = { arm = null; onRefresh() }, enabled = !busy) { Text("Refresh") }
+        }
     )
 }
