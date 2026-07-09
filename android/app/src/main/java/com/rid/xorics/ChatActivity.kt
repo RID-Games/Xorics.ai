@@ -3,6 +3,7 @@ package com.rid.xorics
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.os.SystemClock
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.horizontalScroll
@@ -14,6 +15,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.width
@@ -49,6 +51,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -102,6 +105,29 @@ private fun permissionAsk(reply: String): Pair<Boolean, String?> {
         ?: PERM_GRANT.find(reply)?.groupValues?.get(1)
     return Pair(true, tool)
 }
+
+// --- APP-B4: delivery resilience -----------------------------------------------
+// Until now the reply to a send was delivered exactly one way: as the body of that
+// one blocking POST (Bridge.sendMessage). Server-side, api.py stores the user row
+// BEFORE generation and the assistant row right after — both inside that same
+// request — so any client-side drop (MagicDNS dead on wake, tunnel blip, 5G↔WiFi
+// handover, the 120 s read timeout) lost only DELIVERY while the db quietly kept the
+// truth. Proof: the 2026-07-09 screenshots — reply present after a manual reload,
+// "Unable to resolve host" stuck in the banner. Nothing in the app re-asked for
+// messages after creation (onResume refreshed grants only), so recovery was always
+// manual.
+//
+// The fix inverts the contract: the db is the source of truth and getMessages() is
+// the delivery path. The POST only CAUSES the turn; a watcher polls history until
+// the reply is visible, survives any number of drops, verifies whether a failed
+// POST actually landed before handing the text back for a resend (no silent
+// double-turns), and the whole list re-syncs on every resume. The status banner
+// clears on the first successful sync instead of sticking forever.
+private const val POLL_MS = 2_500L            // watcher cadence while a reply is due
+private const val POLL_SLOW_MS = 10_000L      // relaxed cadence for long tool turns
+private const val POLL_SLOW_AFTER_MS = 60_000L
+private const val WATCH_DEADLINE_MS = 15 * 60_000L
+private const val ESCALATE_AFTER_MS = 8_000L  // drops that self-heal faster than this never reach the banner
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -185,9 +211,40 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
         }
     }
 
-    // Grants are per-process on the bridge, so re-fetch on open and on every
-    // resume rather than trusting anything cached.
-    LaunchedEffect(resumeTick) { refreshPerms() }
+    /** One history fetch; null when the network says no (callers just try again). */
+    suspend fun syncOnce(id: String): List<Bridge.Msg>? = withContext(Dispatchers.IO) {
+        try {
+            Bridge.getMessages(id)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Server truth → screen; returns whether anything changed. History is append-only
+     * and this screen is its only writer, so equal length ⇒ equal content; on any
+     * length difference a full replace keeps the reasoning unarguable.
+     */
+    fun reconcile(server: List<Bridge.Msg>): Boolean {
+        if (server.size == messages.size) return false
+        messages.clear()
+        messages.addAll(server)
+        return true
+    }
+
+    // Grants are per-process on the bridge, so re-fetch on open and on every resume
+    // rather than trusting anything cached. Chat truth lives in the db and can move
+    // while we're backgrounded (a reply that finished after the screen slept) — re-pull
+    // it too. Skip the chat sync while a send's watcher owns the list; it's already
+    // polling.
+    LaunchedEffect(resumeTick) {
+        refreshPerms()
+        val id = chatId ?: return@LaunchedEffect
+        if (sending) return@LaunchedEffect
+        val server = syncOnce(id) ?: return@LaunchedEffect
+        if (reconcile(server) && messages.isNotEmpty()) listState.scrollToItem(messages.size - 1)
+        status = ""  // reachable again — retire any stale error banner
+    }
 
     // Load (or create) the persistent chat, then fetch its history.
     LaunchedEffect(Unit) {
@@ -214,23 +271,93 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
         val id = chatId
         if (text.isEmpty() || id == null || sending) return
         input = ""
+        val baseline = messages.size  // index the user row will occupy in server truth
         messages.add(Bridge.Msg("user", text))
         sending = true
         status = "thinking…"
+
+        // The POST causes the turn; it is no longer the delivery path. Its failure only
+        // tells the watcher to start checking whether the send landed at all. Both
+        // coroutines run on Main, so the flags need no synchronization. NOTE: a failure
+        // here is NOT shown yet — most drops (a WiFi↔5G handover killing the socket
+        // mid-read) self-heal within one watcher tick, and flashing "connection dropped"
+        // for those just trains the operator to ignore the banner. The watcher escalates
+        // only if the drop outlives ESCALATE_AFTER_MS without the row being confirmed.
+        var postFailed = false
+        var postErr: String? = null
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) { Bridge.sendMessage(id, text) }
+            } catch (e: Exception) {
+                postFailed = true
+                postErr = e.message?.take(80)
+            }
+        }
+
+        // The reply watcher: sole renderer of the reply, immune to the POST's fate.
+        // Any number of drops between here and the reply just cost a poll tick each.
         scope.launch {
             listState.animateScrollToItem(messages.size - 1)
+            val start = SystemClock.elapsedRealtime()
+            var absentConfirms = 0
+            var confirmedLanded = false
             try {
-                val reply = withContext(Dispatchers.IO) { Bridge.sendMessage(id, text) }
-                messages.add(reply)
-                status = ""
-                val (asked, tool) = permissionAsk(reply.content)
-                if (asked) {
-                    permHint = tool
-                    showPerms = true
-                    refreshPerms()
+                while (true) {
+                    val elapsed = SystemClock.elapsedRealtime() - start
+                    if (elapsed > WATCH_DEADLINE_MS) {
+                        syncOnce(id)?.let { reconcile(it) }
+                        status = "no reply after 15 min — check the bridge (journalctl); will re-sync on resume"
+                        return@launch
+                    }
+                    delay(if (elapsed > POLL_SLOW_AFTER_MS) POLL_SLOW_MS else POLL_MS)
+                    // Escalate only when a drop has outlived the quiet window without the
+                    // row being confirmed server-side — transient socket kills self-heal
+                    // below and never surface.
+                    if (postFailed && !confirmedLanded &&
+                        SystemClock.elapsedRealtime() - start > ESCALATE_AFTER_MS) {
+                        status = "reconnecting (${postErr ?: "connection dropped"}) — will fetch the reply when the tunnel returns"
+                    }
+                    val server = syncOnce(id) ?: continue  // tunnel down — just try again
+                    val landed = server.size > baseline &&
+                        server[baseline].role == "user" && server[baseline].content == text
+                    when {
+                        landed && server.size >= baseline + 2 -> {
+                            // The reply is in the db — render from truth and finish.
+                            reconcile(server)
+                            status = ""
+                            val (asked, tool) = permissionAsk(server[baseline + 1].content)
+                            if (asked) {
+                                permHint = tool
+                                showPerms = true
+                                refreshPerms()
+                            }
+                            return@launch
+                        }
+                        landed -> {
+                            // Stored server-side, still generating — keep waiting. Also
+                            // retires a "reconnecting" escalation once the row is confirmed.
+                            absentConfirms = 0
+                            confirmedLanded = true
+                            status = "thinking…"
+                        }
+                        postFailed || server.size != baseline -> {
+                            // Our row is missing after the POST gave up, or history diverged
+                            // (something else sits where our turn should be). Two consecutive
+                            // confirmations rule out racing a row insert that's mid-flight;
+                            // then hand the text back for an explicit human retry — never a
+                            // silent one (Bridge.sendClient disables OkHttp's, for the same
+                            // reason: a hidden re-POST can store the turn twice).
+                            absentConfirms++
+                            if (absentConfirms >= 2) {
+                                reconcile(server)  // drops the optimistic bubble; server is truth
+                                input = text
+                                status = "send didn't reach the bridge${postErr?.let { " ($it)" } ?: ""} — tap Send to retry"
+                                return@launch
+                            }
+                        }
+                        else -> Unit  // POST still in flight, row not stored yet — normal early ticks
+                    }
                 }
-            } catch (e: Exception) {
-                status = "error: ${e.message}"
             } finally {
                 sending = false
                 if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
@@ -251,7 +378,11 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
             )
         }
     ) { pad ->
-        Column(Modifier.fillMaxSize().padding(pad)) {
+        // Keyboard rider (2026-07-09): pairs with android:windowSoftInputMode="adjustResize"
+        // on this activity. Resize stops the system panning the whole window (which shoved
+        // the TopAppBar off-screen); imePadding() consumes the IME inset so the input bar
+        // rides above the keyboard instead of being covered by it.
+        Column(Modifier.fillMaxSize().padding(pad).imePadding()) {
             LazyColumn(
                 state = listState,
                 modifier = Modifier.weight(1f).fillMaxWidth(),

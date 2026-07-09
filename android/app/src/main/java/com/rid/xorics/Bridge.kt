@@ -1,5 +1,6 @@
 package com.rid.xorics
 
+import okhttp3.Dns
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -7,6 +8,8 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.net.InetAddress
+import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
 
 /**
@@ -16,13 +19,46 @@ import java.util.concurrent.TimeUnit
 object Bridge {
 
     // Bridge exposed via `tailscale serve 8090`. Phone reaches it over the tailnet.
-    const val BASE = "https://ridgames.tail893cf4.ts.net"
+    const val HOST = "ridgames.tail893cf4.ts.net"
+    const val BASE = "https://$HOST"
+
+    // RIDGames's tailnet IP — stable for the node's life on the tailnet. Used ONLY as
+    // a DNS fallback below, never in a URL: the URL must keep the hostname so TLS SNI
+    // and certificate verification still see the .ts.net name.
+    private val HOST_ADDR = byteArrayOf(100, 121, 204.toByte(), 85)
+
+    /**
+     * APP-B4: MagicDNS resolution dies on wake ("Unable to resolve host
+     * ridgames.tail893cf4.ts.net", 2026-07-09 screenshots) independently of whether
+     * the tunnel itself is up. System DNS stays authoritative; when it can't answer
+     * for our host, pin the known tailnet IP. `getByAddress(hostname, addr)` keeps
+     * the hostname attached to the address, so this bypasses DNS only — hostname
+     * verification is untouched — and `tailscale serve` listens on the node's tailnet
+     * IP:443, so the pinned route terminates at the same place. If the tunnel is
+     * truly down, the pinned connect fails too and the caller's recovery path
+     * (ChatActivity's reply watcher) takes it from there.
+     */
+    private object PinnedDns : Dns {
+        override fun lookup(hostname: String): List<InetAddress> {
+            try {
+                val addrs = Dns.SYSTEM.lookup(hostname)
+                if (addrs.isNotEmpty()) return addrs
+            } catch (_: UnknownHostException) {
+                // fall through to the pin
+            }
+            if (hostname.equals(HOST, ignoreCase = true)) {
+                return listOf(InetAddress.getByAddress(hostname, HOST_ADDR))
+            }
+            throw UnknownHostException("no addresses for $hostname")
+        }
+    }
 
     // Must match XORICS_BRIDGE_TOKEN on the server if you set one. It is currently
     // unset, so any value is accepted.
     const val TOKEN = "xorics-app"
 
     private val client = OkHttpClient.Builder()
+        .dns(PinnedDns)
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)
         .build()
@@ -32,6 +68,16 @@ object Bridge {
     // pool, stretch only the read timeout.
     private val slowClient = client.newBuilder()
         .readTimeout(600, TimeUnit.SECONDS)
+        .build()
+
+    // APP-B4: sendMessage is the one non-idempotent call in the app. OkHttp's default
+    // retryOnConnectionFailure can silently re-POST a request whose first attempt DID
+    // reach the server (stale pooled connection; drop while reading the response) —
+    // storing the user turn twice and burning a second model run. Turn it off here
+    // only: the reply watcher in ChatActivity owns retry/verify semantics, and it
+    // checks the db before ever letting a resend happen.
+    private val sendClient = client.newBuilder()
+        .retryOnConnectionFailure(false)
         .build()
 
     private fun auth(b: Request.Builder) = b.addHeader("Authorization", "Bearer $TOKEN")
@@ -123,13 +169,18 @@ object Bridge {
         }
     }
 
-    /** Send a user turn to a chat (server feeds prior turns back to the model); returns the reply. */
+    /**
+     * Send a user turn to a chat (server feeds prior turns back to the model); returns
+     * the reply. APP-B4: callers must treat the return value as advisory — the reply's
+     * delivery path of record is getMessages() (the db is truth). This call's job is to
+     * CAUSE the turn; its response body is a courtesy that any tunnel drop can eat.
+     */
     fun sendMessage(chatId: String, content: String): Msg {
         val payload = JSONObject().put("content", content)
         val req = auth(Request.Builder().url("$BASE/v1/chats/$chatId/messages"))
             .post(payload.toString().toRequestBody("application/json".toMediaType()))
             .build()
-        client.newCall(req).execute().use { r ->
+        sendClient.newCall(req).execute().use { r ->
             val body = r.body?.string().orEmpty()
             if (!r.isSuccessful) throw IOException("sendMessage ${r.code}: ${body.take(160)}")
             val a = JSONObject(body).getJSONObject("assistant_message")

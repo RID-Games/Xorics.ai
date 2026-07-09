@@ -30,10 +30,15 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.Xorics">
 
-        <!-- Chat is the front door now. -->
+        <!-- Chat is the front door now. adjustResize: with no soft-input mode set,
+             targetSdk-35 edge-to-edge lets the system PAN the window when the keyboard
+             opens — shoving the TopAppBar off-screen. Resize stops the pan; the
+             imePadding() in ChatScreen consumes the reported IME inset so the input
+             bar rides the keyboard instead of being covered by it. -->
         <activity
             android:name=".ChatActivity"
-            android:exported="true">
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
