@@ -497,13 +497,18 @@ def _selfedit_changed_files():
 def _selfedit_diff(rels, max_lines=200):
     """A unified diff (live vs workspace) for `rels`, truncated. Plain difflib — no git needed."""
     import difflib
+    def _read_lines(p):
+        raw = open(p, "rb").read()
+        if b"\x00" in raw:
+            return ["(binary file)\n"]
+        return raw.decode("utf-8", errors="replace").splitlines(keepends=True)
     ws = os.path.join(_SELFEDIT_WORKSPACE, "work")
     chunks = []
     for rel in rels:
         live_abs = os.path.join(REPO_ROOT, rel)
         new_abs = os.path.join(ws, rel)
-        old = open(live_abs).read().splitlines(keepends=True) if os.path.exists(live_abs) else []
-        new = open(new_abs).read().splitlines(keepends=True)
+        old = _read_lines(live_abs) if os.path.exists(live_abs) else []
+        new = _read_lines(new_abs)
         chunks.append("".join(difflib.unified_diff(
             old, new, fromfile=f"live/{rel}", tofile=f"verified/{rel}")))
     text = "\n".join(c for c in chunks if c.strip())
