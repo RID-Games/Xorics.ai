@@ -85,6 +85,9 @@ object Bridge {
     /** One turn in a conversation. */
     data class Msg(val role: String, val content: String)
 
+    /** Summary of a stored chat — used for the chat list. */
+    data class ChatMeta(val id: String, val title: String, val updatedAt: Double)
+
     /** Send recorded audio bytes, get back the transcript. */
     fun stt(audio: ByteArray): String {
         val req = auth(Request.Builder().url("$BASE/stt"))
@@ -150,6 +153,22 @@ object Bridge {
             val body = r.body?.string().orEmpty()
             if (!r.isSuccessful) throw IOException("createChat ${r.code}: ${body.take(160)}")
             return JSONObject(body).getString("id")
+        }
+    }
+
+    /** List all stored chats. */
+    fun listChats(): List<ChatMeta> {
+        val req = auth(Request.Builder().url("$BASE/v1/chats")).get().build()
+        client.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("listChats ${r.code}: ${body.take(160)}")
+            val arr = JSONObject(body).getJSONArray("chats")
+            val out = ArrayList<ChatMeta>(arr.length())
+            for (i in 0 until arr.length()) {
+                val c = arr.getJSONObject(i)
+                out.add(ChatMeta(c.getString("id"), c.getString("title"), c.getDouble("updated_at")))
+            }
+            return out
         }
     }
 
