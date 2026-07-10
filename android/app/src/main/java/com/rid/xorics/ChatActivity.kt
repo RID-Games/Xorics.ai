@@ -132,6 +132,7 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
     var status by remember { mutableStateOf("connecting…") }
     var chatId by remember { mutableStateOf<String?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
+    var chats by remember { mutableStateOf<List<Bridge.ChatMeta>>(emptyList()) }
     var watcherJob by remember { mutableStateOf<Job?>(null) }
     val listState = rememberLazyListState()
 
@@ -365,7 +366,7 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
             TopAppBar(
                 title = { Text("Xorics") },
                 actions = {
-                    IconButton(onClick = { menuOpen = true }) {
+                    IconButton(onClick = { menuOpen = true; scope.launch { chats = withContext(Dispatchers.IO) { try { Bridge.listChats() } catch (_: Exception) { emptyList() } } } }) {
                         Icon(Icons.Default.Menu, contentDescription = "Menu")
                     }
                     DropdownMenu(
@@ -387,6 +388,8 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
                             }
                         )
                         HorizontalDivider()
+                        chats.forEach { c -> DropdownMenuItem(text = { Text(c.title.ifBlank { "Untitled chat" }) }, onClick = { menuOpen = false; watcherJob?.cancel(); context.getSharedPreferences("xorics", Context.MODE_PRIVATE).edit().putString("chatId", c.id).apply(); chatId = c.id; scope.launch { val hist = withContext(Dispatchers.IO) { try { Bridge.getMessages(c.id) } catch (_: Exception) { null } }; if (chatId == c.id) { if (hist != null) { messages.clear(); messages.addAll(hist); status = ""; if (messages.isNotEmpty()) listState.scrollToItem(messages.size - 1) } else status = "couldn't load history" } } }) }
+                        if (chats.isNotEmpty()) HorizontalDivider()
                         DropdownMenuItem(
                             text = { Text("Edits") },
                             onClick = { menuOpen = false; showEdits = true; refreshEdits() }
