@@ -114,6 +114,29 @@ finally:
     sandbox.container_runtime = _real_runtime
     shutil.rmtree(_TMP, ignore_errors=True)
 
+# ---- _selfedit_verify_cmd: android/ branch adds an offline Kotlin compile ------
+# The verify stays code-chosen, never model-chosen. The python suite can't exercise
+# Kotlin, so when the changed set touches android/ the sandbox also compiles it
+# offline (deps baked into the image). We monkey-patch _selfedit_changed_files (the
+# only input the helper reads) so we don't have to stage real files.
+_real_changed_files = xorics._selfedit_changed_files
+try:
+    xorics._selfedit_changed_files = lambda: ["android/app/x.kt"]
+    cmd_android = xorics._selfedit_verify_cmd()
+    check("verify_cmd: android/ adds compileDebugKotlin",
+          "compileDebugKotlin" in cmd_android)
+    check("verify_cmd: android/ keeps the python suite first",
+          cmd_android.startswith(xorics._SELFEDIT_VERIFY_CMD))
+
+    xorics._selfedit_changed_files = lambda: ["xorics.py"]
+    cmd_py = xorics._selfedit_verify_cmd()
+    check("verify_cmd: non-android stays at the python suite",
+          cmd_py == xorics._SELFEDIT_VERIFY_CMD)
+    check("verify_cmd: non-android does NOT add compileDebugKotlin",
+          "compileDebugKotlin" not in cmd_py)
+finally:
+    xorics._selfedit_changed_files = _real_changed_files
+
 # ---- _SELFEDIT_STAGE_IGNORE contents -----------------------------------------
 # android Kotlin sources must stage into the workspace, but build outputs, gradle
 # caches, and binary archives stay excluded; android.bak-* is still ignored.

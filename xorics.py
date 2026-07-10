@@ -341,6 +341,16 @@ def _selfedit_reset():
     shutil.rmtree(_SELFEDIT_WORKSPACE, ignore_errors=True)
 
 
+def _selfedit_verify_cmd():
+    # the verify stays code-chosen, never model-chosen; the python suite can't exercise Kotlin,
+    # so when the changed set touches android/ the sandbox also compiles it offline (deps are
+    # baked into the image)
+    cmd = _SELFEDIT_VERIFY_CMD
+    if any(r.startswith("android/") for r in _selfedit_changed_files()):
+        cmd = cmd + " && cd android && gradle --offline --no-daemon -q :app:compileDebugKotlin"
+    return cmd
+
+
 def write_file(path: str, content: str) -> str:
     """Write `content` to a repo file (path RELATIVE to the repo root, e.g. 'notebook.py'),
     apply it to a COPY of the tree, run the full test suite in a throwaway container, and report
@@ -377,7 +387,7 @@ def write_file(path: str, content: str) -> str:
                 "meant to change it, send the modified content.")
     is_new = not lp.exists()
 
-    res = sandbox.run(ws, _SELFEDIT_VERIFY_CMD, artifacts=[rel],
+    res = sandbox.run(ws, _selfedit_verify_cmd(), artifacts=[rel],
                       image=_selfedit_image(), network=False)
     if res.error:
         return f"write_file ERROR: the sandbox could not run the suite: {res.error}"
@@ -447,7 +457,7 @@ def str_replace(path: str, old_str: str, new_str: str = "") -> str:
         return (f"NO CHANGE: after the replacement {rel} is byte-identical to the live file — nothing to "
                 "verify. If you meant to change it, check that old_str and new_str differ.")
 
-    res = sandbox.run(ws, _SELFEDIT_VERIFY_CMD, artifacts=[rel],
+    res = sandbox.run(ws, _selfedit_verify_cmd(), artifacts=[rel],
                       image=_selfedit_image(), network=False)
     if res.error:
         return f"str_replace ERROR: the sandbox could not run the suite: {res.error}"
@@ -566,7 +576,7 @@ def promote_self_edit(message=None):
                 "tree, so refusing. Start podman and retry.")
     ws = os.path.join(_SELFEDIT_WORKSPACE, "work")
 
-    res = sandbox.run(ws, _SELFEDIT_VERIFY_CMD, image=_selfedit_image(), network=False)
+    res = sandbox.run(ws, _selfedit_verify_cmd(), image=_selfedit_image(), network=False)
     if res.error:
         return f"PROMOTE ERROR: re-verification could not run: {res.error}"
     if not res.ok:
