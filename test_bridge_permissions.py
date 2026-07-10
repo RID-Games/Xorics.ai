@@ -41,8 +41,8 @@ try:
     r = c.get("/v1/permissions")
     check("GET /v1/permissions -> 200", r.status_code == 200)
     body = r.json()
-    check("GET: privileged == ['str_replace', 'write_file']",
-          body["privileged"] == ["str_replace", "write_file"])
+    check("GET: privileged == ['android_deploy', 'str_replace', 'write_file']",
+          body["privileged"] == ["android_deploy", "str_replace", "write_file"])
     check("GET: granted == [] (fresh start)", body["granted"] == [])
 
     # ---- POST /v1/permissions/grant ---------------------------------------
