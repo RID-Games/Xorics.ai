@@ -1188,7 +1188,7 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
         # MiniMax M3 buries its chain-of-thought inside `content` as <think>…</think> unless
         # asked to split it out — which would pollute the honesty gate + SKiDL-fence parsing.
         # reasoning_split keeps `content` clean. Empty extra_body is a no-op for local models.
-        extra = {"reasoning_split": True} if model == MINIMAX else {}
+        extra = {"reasoning_split": True, "max_tokens": 16384} if model == MINIMAX else {}
         try:
             resp = client_for(model).chat.completions.create(
                 model=model, messages=messages, tools=active, extra_body=extra)
@@ -1198,6 +1198,8 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
         msg = resp.choices[0].message
         if not msg.tool_calls:
             final_text = msg.content or ""
+            if not final_text:
+                final_text = "⚠ empty reply from " + model + " (finish_reason=" + str(resp.choices[0].finish_reason) + ") — reasoning likely exhausted the token budget; retry the task or raise max_tokens."
             break
         messages.append({"role": "assistant", "content": msg.content or "",
                          "tool_calls": [{"id": tc.id, "type": "function",
