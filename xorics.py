@@ -829,7 +829,7 @@ TOOLS = [
 # Manager (gpt-oss) routes + delegates; it does NOT compile directly.
 MANAGER_TOOLS = [t for t in TOOLS if t["function"]["name"]
                  in ("web_search", "see_image", "search_datasheets", "delegate_to_coder",
-                     "finalize_design", "geocode", "show_route", "clear_route")]
+                     "finalize_design", "geocode", "show_route", "clear_route", "read_file")]
 # Coder's own toolset (used inside delegate_to_coder and in manual /code mode).
 CODER_TOOLS = [t for t in TOOLS if t["function"]["name"]
                in ("compile_check", "check_circuit_file", "validate_circuit",
