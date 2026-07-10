@@ -1189,8 +1189,12 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
         # asked to split it out — which would pollute the honesty gate + SKiDL-fence parsing.
         # reasoning_split keeps `content` clean. Empty extra_body is a no-op for local models.
         extra = {"reasoning_split": True} if model == MINIMAX else {}
-        resp = client_for(model).chat.completions.create(
-            model=model, messages=messages, tools=active, extra_body=extra)
+        try:
+            resp = client_for(model).chat.completions.create(
+                model=model, messages=messages, tools=active, extra_body=extra)
+        except Exception as e:
+            final_text = "⚠ model call failed: " + type(e).__name__ + ": " + str(e)
+            break
         msg = resp.choices[0].message
         if not msg.tool_calls:
             final_text = msg.content or ""
