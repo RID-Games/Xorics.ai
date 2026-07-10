@@ -36,7 +36,7 @@ RUN python -c "import openai, numpy, fitz, ddgs, fastapi; print('xorics sandbox 
 #
 # DESIGN: the runtime sandbox stays network=False (hermetic). Everything a compile
 # needs is therefore baked HERE, where the image build legitimately has network:
-#   * JDK 17            — AGP 8.7.x's requirement
+#   * JDK 21            — AGP 8.7.x's requirement
 #   * Gradle 8.10.2     — standalone, matching the repo wrapper version, because
 #                         the selfedit workspace excludes *.jar so ./gradlew can
 #                         never run there; `gradle` on PATH is the runtime entry.
@@ -49,7 +49,7 @@ RUN python -c "import openai, numpy, fitz, ddgs, fastapi; print('xorics sandbox 
 # in build.gradle.kts will fail --offline with a clear "offline mode" error — that
 # is the signal to rebuild, not a bug).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        openjdk-17-jdk-headless curl unzip \
+        openjdk-21-jdk-headless curl unzip \
     && rm -rf /var/lib/apt/lists/*
 
 ENV ANDROID_HOME=/opt/android-sdk \
@@ -75,4 +75,8 @@ RUN cd /tmp/warm/android && gradle --no-daemon :app:compileDebugKotlin \
 # The runner overrides cwd via the mount; /work just keeps an interactive
 # `podman run -it localhost/xorics-sandbox` intuitive. No CMD: sandbox.run()
 # always passes the command explicitly, so any CMD here would be ignored.
+# sh -lc is a LOGIN shell: /etc/profile resets PATH, erasing image ENV PATH additions.
+# Park gradle where the default PATH survives.
+RUN ln -s /opt/gradle/bin/gradle /usr/local/bin/gradle
+
 WORKDIR /work

@@ -1,0 +1,22 @@
+# Keep the podman build context lean: the image only ever COPYs
+# requirements-sandbox.txt and android/ (for the warm compile) — everything
+# else here just bloats context upload or, worse, poisons the warm copy with
+# host build output.
+android/app/build
+android/build
+android/.gradle
+.git
+venv
+skidl-venv
+nominatim
+nominatim-venv
+hermes-runtime
+data
+state
+inbox
+datasheets
+rag_index
+notebooks
+sketches
+circuits
+*.bak
