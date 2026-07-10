@@ -115,3 +115,6 @@ data/
 
 # Upstream Hermes runtime (integrated against, not vendored)
 hermes-runtime/
+nav/
+nominatim/
+g2/xorics-dash/node_modules/

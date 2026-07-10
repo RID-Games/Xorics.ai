@@ -32,6 +32,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -57,6 +58,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -146,6 +148,7 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
     var status by remember { mutableStateOf("connecting…") }
     var chatId by remember { mutableStateOf<String?>(null) }
     var menuOpen by remember { mutableStateOf(false) }
+    var watcherJob by remember { mutableStateOf<Job?>(null) }
     val listState = rememberLazyListState()
 
     // Permission card state (APP-B2). perms is only ever what the bridge last said.
@@ -303,13 +306,14 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
 
         // The reply watcher: sole renderer of the reply, immune to the POST's fate.
         // Any number of drops between here and the reply just cost a poll tick each.
-        scope.launch {
+        watcherJob = scope.launch {
             listState.animateScrollToItem(messages.size - 1)
             val start = SystemClock.elapsedRealtime()
             var absentConfirms = 0
             var confirmedLanded = false
             try {
                 while (true) {
+                    if (chatId != id) return@launch
                     val elapsed = SystemClock.elapsedRealtime() - start
                     if (elapsed > WATCH_DEADLINE_MS) {
                         syncOnce(id)?.let { reconcile(it) }
@@ -384,6 +388,21 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
                         expanded = menuOpen,
                         onDismissRequest = { menuOpen = false }
                     ) {
+                        DropdownMenuItem(
+                            text = { Text("New chat") },
+                            onClick = {
+                                menuOpen = false
+                                watcherJob?.cancel()
+                                scope.launch {
+                                    val newId = withContext(Dispatchers.IO) { Bridge.createChat() }
+                                    context.getSharedPreferences("xorics", Context.MODE_PRIVATE).edit().putString("chatId", newId).apply()
+                                    chatId = newId
+                                    messages.clear()
+                                    status = ""
+                                }
+                            }
+                        )
+                        HorizontalDivider()
                         DropdownMenuItem(
                             text = { Text("Edits") },
                             onClick = { menuOpen = false; showEdits = true; refreshEdits() }
