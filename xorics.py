@@ -672,6 +672,14 @@ TOOLS = [
                        "its default preview route.",
         "parameters": {"type": "object", "properties": {}, "required": []}}},
     {"type": "function", "function": {
+        "name": "android_deploy",
+        "description": "Ship the currently STAGED android self-edit to the operator's phone: copies "
+                       "the staged changed files into the live tree, runs the real gradle "
+                       "assembleDebug, and Taildrops the APK with its sha256. Refuses unless a "
+                       "self-edit is staged and every changed file is under android/. Never touches "
+                       "git; the stage stays for review. Call only when the operator asks to deploy.",
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
         "name": "search_datasheets",
         "description": "Search the local hardware-doc index (datasheets, ESP32-C3 reference, pin maps) "
                        "for parts, registers, pinouts, or specs. Use instead of guessing.",
@@ -874,7 +882,7 @@ _RESEARCH_TOOLS = {"web_search", "search_datasheets", "fetch_datasheet",
 # stay, since those return VERIFIED parts it needs to actually write. XORICS-FEATURE: convergence-guard
 _SOFT_RESEARCH_TOOLS = {"web_search", "search_datasheets", "fetch_datasheet"}
 # Privileged tools the manager may only call behind an explicit operator grant — deny-all default, enforcement comes later at the exec chokepoint. XORICS-FEATURE: tool-permissions
-_PRIVILEGED_TOOLS = {"write_file", "str_replace"}
+_PRIVILEGED_TOOLS = {"write_file", "str_replace", "android_deploy"}
 _CONVERGENCE_NUDGE = (
     "\n\n⛔ CONVERGENCE — you have run {n} look-ups without validating a circuit. You already have the "
     "parts you need; find_part returns VERIFIED parts, so STOP searching. In your NEXT message write a "
@@ -1888,7 +1896,49 @@ def finalize_design(paths=None):
     return _ToolResult("VERIFIED — every claimed deliverable built/compiled this session and exists on disk.\n"
                        "Verified deliverables:\n" + listing, "verified")
 
+def android_deploy():
+    """Ship the currently STAGED android self-edit to the operator's phone: copies the
+    staged changed files into the live tree, runs the real gradle assembleDebug, and
+    Taildrops the APK with its sha256. Refuses unless a self-edit is staged and every
+    changed file is under android/. Never touches git; the stage stays for review."""
+    try:
+        import subprocess
+        import shutil
+        changed = _selfedit_changed_files()
+        if not changed:
+            return "DEPLOY REFUSED: nothing staged — run /selfedit first."
+        outside = [p for p in changed if not p.startswith("android/")]
+        if outside:
+            return "DEPLOY REFUSED: changed set leaves android/: " + ", ".join(outside)
+        for rel in changed:
+            dst = os.path.join(REPO_ROOT, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(os.path.join(_SELFEDIT_WORKSPACE, "work", rel), dst)
+        proc = subprocess.run(["./gradlew", "assembleDebug"],
+                              cwd=os.path.join(REPO_ROOT, "android"),
+                              capture_output=True, text=True, timeout=900)
+        if proc.returncode != 0:
+            tail = "\n".join(((proc.stdout or "") + "\n" + (proc.stderr or "")).splitlines()[-30:])
+            return ("BUILD FAILED (exit " + str(proc.returncode) +
+                    ") — live tree now holds the staged copies; fix or git checkout them.\n" + tail)
+        apk = os.path.join(REPO_ROOT, "android/app/build/outputs/apk/debug/app-debug.apk")
+        with open(apk, "rb") as f:
+            h = hashlib.sha256(f.read()).hexdigest()
+        size = os.path.getsize(apk)
+        td = subprocess.run(["tailscale", "file", "cp", apk, "zawayixs-z-fold5:"],
+                            capture_output=True, text=True, timeout=180)
+        if td.returncode != 0:
+            return ("BUILD OK (sha256 " + h + ", " + str(size) + " bytes) but TAILDROP FAILED (exit "
+                    + str(td.returncode) + "): " + (td.stderr or "").strip())
+        return ("DEPLOYED: " + str(len(changed)) + " file(s) (" + ", ".join(changed) +
+                "), assembleDebug exit 0, apk " + str(size) + " bytes, sha256 " + h +
+                ", Taildrop sent. Stage left intact — hardware-prove, then commit+push and /discard.")
+    except Exception as e:
+        return "DEPLOY ERROR: " + type(e).__name__ + ": " + str(e)
+
+
 TOOL_IMPLS["finalize_design"] = finalize_design   # register now that it's defined
+TOOL_IMPLS["android_deploy"] = android_deploy
 
 def _append_manifest_footer(text, outcome, deliv_before):
     """Machine-generated truth footer. Fires only on design turns, reporting whether a board actually
