@@ -2235,7 +2235,135 @@ def ask(user_message: str, history=None) -> str:
     include it in history. None/[] -> single-shot. ask() is STATELESS: it never reads or writes a
     global transcript, so persistence is the caller's job — store.py for the app, the REPL for the
     console. Existing single-arg callers are unaffected. XORICS-FEATURE: stateless-history
+
+    REPL commands are handled here too so the phone app gets the same interface.
+    Commands that normally use input() (e.g. /promote y/N) return the state/diff instead,
+    letting the app present the review UI and call /v1/selfedit/promote separately.
     """
+    # --- REPL command routing (shared with the console REPL) --------------------
+    # Self-edit continuation: feed response back into the existing session so the
+    # model sees the full conversation. XORICS-FEATURE: self-edit
+    if _SELFEDIT_ACTIVE:
+        ans = run_self_edit(task=user_message, brain=_SELFEDIT_BRAIN,
+                            messages=_SELFEDIT_MESSAGES)
+        return str(ans)
+
+    # /selfedit — start a self-edit session (sandbox-verified, human approval gate)
+    if user_message.startswith("/selfedit "):
+        task = user_message[9:].strip()
+        if not task:
+            return ("usage: /selfedit <what to change in Xorics's own code>\n"
+                    "every write is sandbox-verified; live tree untouched until you approve.\n"
+                    "review: GET /v1/selfedit   promote: POST /v1/selfedit/promote\n"
+                    "discard: POST /v1/selfedit/discard")
+        driver = MINIMAX if BRAIN == MINIMAX else CODER
+        return str(run_self_edit(task, brain=driver))
+
+    # /orchestrate — plan + run multi-brick goal with auto-promote. XORICS-FEATURE: orchestrate
+    if user_message.startswith("/orchestrate "):
+        goal = user_message[12:].strip()
+        if not goal:
+            return ("usage: /orchestrate <goal>\n"
+                    "breaks a goal into bricks, runs /selfedit for each, auto-promotes on success.\n"
+                    "verbose per-brick output. run /power first to plan on MiniMax M3.")
+        driver = MINIMAX if BRAIN == MINIMAX else MANAGER
+        return str(run_orchestrate(goal, brain=driver))
+
+    # /design — read-only planning, prints spec without editing. XORICS-FEATURE: design-mode
+    if user_message.startswith("/design "):
+        goal = user_message[7:].strip()
+        if not goal:
+            return "usage: /design <what to plan>  (read-only — makes NO edits)"
+        driver = MINIMAX if BRAIN == MINIMAX else MANAGER
+        return str(run_design(goal, brain=driver))
+
+    # /build — run /selfedit on the last /design spec. XORICS-FEATURE: design-mode
+    if user_message.strip() == "/build":
+        driver = MINIMAX if BRAIN == MINIMAX else CODER
+        return str(run_build(brain=driver))
+
+    # /plan — read-only mode, break a feature into bricks. XORICS-FEATURE: plan-mode
+    if user_message.startswith("/plan "):
+        PLAN_MODE = True
+        goal = user_message[5:].strip()
+        if not goal:
+            return "usage: /plan <goal>  (read-only)"
+        # fall through to the model with PLAN_MODE set
+
+    # /promote — review pending self-edit (no input() prompt; return diff for the app)
+    if user_message.startswith("/promote"):
+        rels, diff, task = review_self_edit()
+        if not rels:
+            return "nothing pending to promote."
+        msg = user_message[8:].strip() or None
+        # Re-verify in sandbox before promoting
+        status = promote_self_edit(message=msg)
+        return f"Pending self-edit for: {task}\nchanged: {', '.join(rels)}\n\n{diff}\n\n{status}"
+
+    # /discard — drop pending self-edit
+    if user_message.strip() == "/discard":
+        return discard_self_edit()
+
+    # /grants — list tool permissions
+    if user_message.strip() == "/grants":
+        priv = "privileged: " + ", ".join(sorted(_PRIVILEGED_TOOLS))
+        granted = "granted: " + (", ".join(sorted(_TOOL_GRANTS)) if _TOOL_GRANTS else "(none)")
+        return priv + "\n" + granted
+
+    # /grant — grant a privileged tool
+    if user_message.startswith("/grant "):
+        t = user_message[7:].strip()
+        if _grant_tool(t):
+            return f"granted: {t}  (revoke with /revoke {t})"
+        return (f"refused: {t} is not a privileged tool — grantable: "
+                + ", ".join(sorted(_PRIVILEGED_TOOLS)))
+
+    # /revoke — revoke a granted tool
+    if user_message.startswith("/revoke "):
+        t = user_message[8:].strip()
+        return ("revoked: " + t) if _revoke_tool(t) else (t + " was not granted")
+
+    # /reset — clear conversation history
+    if user_message.strip() in ("/reset", "/new"):
+        reset_history()
+        _SELFEDIT_ACTIVE = False
+        _SELFEDIT_MESSAGES = []
+        _SELFEDIT_BRAIN = CODER
+        return "conversation cleared — fresh context."
+
+    # /cancel — pause self-edit session
+    if user_message.strip() == "/cancel":
+        if not _SELFEDIT_ACTIVE:
+            return "not in a self-edit session."
+        _SELFEDIT_ACTIVE = False
+        _SELFEDIT_MESSAGES = []
+        _SELFEDIT_BRAIN = CODER
+        return "self-edit session paused. use /promote or /discard to resolve, or /selfedit <task> to start new."
+
+    # /chat — switch to manager mode
+    if user_message.startswith("/chat "):
+        BRAIN = MANAGER; PLAN_MODE = False
+        user_message = user_message[5:].strip()
+
+    # /power — switch to MiniMax M3 manager
+    if user_message.startswith("/power "):
+        if os.environ.get("MINIMAX_API_KEY"):
+            BRAIN = MINIMAX
+            user_message = user_message[6:].strip()
+        else:
+            return "MINIMAX_API_KEY not set — /power unavailable."
+
+    # /local — switch back to local manager (gpt-oss)
+    if user_message.startswith("/local "):
+        BRAIN = MANAGER; PLAN_MODE = False
+        user_message = user_message[6:].strip()
+
+    # /code — switch to direct coder mode
+    if user_message.startswith("/code "):
+        BRAIN = CODER; PLAN_MODE = False
+        user_message = user_message[5:].strip()
+    # --- end command routing ----------------------------------------------------
+
     is_coder = BRAIN == CODER
     if is_coder:
         system = f"You are {NAME}, the coding specialist, in manual coding mode. " + _CODER_GUIDE
