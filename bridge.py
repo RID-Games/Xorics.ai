@@ -432,6 +432,24 @@ async def selfedit_discard(request: Request):
     return await run_in_threadpool(_selfedit_discard)
 
 
+# --- operator restart all services -------------------------------------------
+# Kills bridge (can't kill itself so a subprocess does it), REPL, llama-swap,
+# then restarts everything in the correct order. Safe to call anytime; idempotent.
+@app.post("/v1/admin/restart")
+async def admin_restart(request: Request):
+    _auth(request)
+    proc = subprocess.run(
+        ["/bin/bash", os.path.join(os.path.dirname(__file__), "restart.sh")],
+        capture_output=True, text=True, timeout=60,
+        env=dict(os.environ, GIT_TERMINAL_PROMPT="0"),
+    )
+    return {
+        "returncode": proc.returncode,
+        "stdout": proc.stdout or "",
+        "stderr": proc.stderr or "",
+    }
+
+
 _PAGE = """<!doctype html>
 <html lang="en">
 <head>
