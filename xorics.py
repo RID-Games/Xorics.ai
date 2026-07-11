@@ -1302,7 +1302,10 @@ def _agent_loop(model, messages, tools, *, checkpoint, tag):
                 except Exception as e:
                     result = f"[tool error in {name}: {e}] — adjust and try another approach."
                     print(f"  [{tag}→{name}] ERROR: {e}")
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)})
+            out = str(result)
+            if model != MINIMAX and len(out) > 24000:
+                out = out[:24000] + "\n...[tool result truncated at 24000 of " + str(len(out)) + " chars for the local model's context — call grep_file to find the region, then read_file with start_line and a small max_chars]"
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": out})
             # Structured success: check_circuit told us it BUILT (via .status, not text-matching).
             # Capture the exact script that passed so a later edit can't overwrite the win.
             if getattr(result, "status", None) == "built":
