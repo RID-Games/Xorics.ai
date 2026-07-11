@@ -617,6 +617,10 @@ def promote_self_edit(message=None):
     head = subprocess.run(["git", "-C", REPO_ROOT, "rev-parse", "--short", "HEAD"],
                           capture_output=True, text=True).stdout.strip()
     _selfedit_reset()                        # promoted — clear the workspace
+    # Also clear the REPL session state so a subsequent /selfedit starts fresh.
+    xorics._SELFEDIT_ACTIVE = False
+    xorics._SELFEDIT_MESSAGES = []
+    xorics._SELFEDIT_BRAIN = xorics.CODER
     return (f"PROMOTED — applied to the live repo and committed ({head or 'HEAD'}): "
             + ", ".join(applied) + ". Re-verified green in the sandbox before writing.")
 
@@ -625,6 +629,10 @@ def discard_self_edit():
     """Throw away the pending verified change without touching the live tree."""
     had = bool(_selfedit_changed_files())
     _selfedit_reset()
+    # Also clear the REPL session state so a subsequent /selfedit starts fresh.
+    xorics._SELFEDIT_ACTIVE = False
+    xorics._SELFEDIT_MESSAGES = []
+    xorics._SELFEDIT_BRAIN = xorics.CODER
     return ("DISCARDED — the pending self-edit was thrown away; the live tree was untouched."
             if had else "Nothing pending to discard.")
 
@@ -1718,31 +1726,70 @@ def _selfedit_incomplete(task, pending):
     return sorted(named - wrote)
 
 
-def run_self_edit(task: str, brain=None) -> str:
-    """Run a self-edit `task` with ONLY read_file + write_file, on `brain` (default the local coder;
-    pass MINIMAX to drive big-file edits on the remote frontier brain — the local coder's 8K context
-    can't hold a large file like xorics.py to rewrite it, M3's can). Each proposed write is applied to
-    a COPY of the repo and verified by the full suite in a sandbox; the live tree is never mutated here
-    (promotion is the approval gate, Brick C). Returns the driver's final report. XORICS-FEATURE: self-edit"""
+# ---- self-edit session state (REPL-level, survives across user turns) -------------
+# _SELFEDIT_ACTIVE: whether the REPL is currently in an ongoing self-edit session.
+# _SELFEDIT_MESSAGES: the accumulated message list for this session (system + all
+# prior user/assistant/tool turns). Passed to _agent_loop so each new response is
+# appended to the same conversation instead of cold-starting every turn.
+# _SELFEDIT_BRAIN: which brain is driving this session (CODER or MINIMAX).
+# Without this, a follow-up response from the user gets sent to ask() (normal mode)
+# instead of back into run_self_edit, and the model cold-starts from scratch — the
+# exact context-loss bug this fixes. XORICS-FEATURE: self-edit
+_SELFEDIT_ACTIVE = False
+_SELFEDIT_MESSAGES = []
+_SELFEDIT_BRAIN = CODER
+
+
+def run_self_edit(task: str = None, brain=None, *, messages=None) -> str:
+    """Run a self-edit `task` with ONLY read_file + write_file, on `brain` (default the
+    local coder; pass MINIMAX to drive big-file edits on the remote frontier brain —
+    the local coder's 8K context can't hold a large file like xorics.py to rewrite it,
+    M3's can). Each proposed write is applied to a COPY of the repo and verified by the
+    full suite in a sandbox; the live tree is never mutated here (promotion is the
+    approval gate).
+
+    Supports CONTINUATION: pass `messages` (the accumulated message list from a prior
+    call) and a `task` string — the task is appended as a new user turn, the existing
+    messages are passed through to _agent_loop, and the model sees the full conversation
+    instead of cold-starting. The self-edit system prompt lives in the SYSTEM message
+    (one-time, not per-turn) so it doesn't bloat every turn's context budget.
+    XORICS-FEATURE: self-edit"""
+    global _SELFEDIT_ACTIVE, _SELFEDIT_MESSAGES, _SELFEDIT_BRAIN
     brain = brain or CODER
-    _selfedit_reset()                            # fresh copy of the live tree for this session
-    os.makedirs(_SELFEDIT_WORKSPACE, exist_ok=True)
-    try:
-        open(_SELFEDIT_TASK_FILE, "w").write(task or "")   # for the promote commit message
-    except OSError:
-        pass
-    messages = [
-        {"role": "system",
-         "content": f"You are the {NAME} coding specialist ({brain}). " + _SELF_EDIT_GUIDE},
-        {"role": "user", "content": task},
-    ]
-    final_text, messages, _built, _outcome = _agent_loop(
-        brain, messages, SELF_EDIT_TOOLS, checkpoint=True, tag="selfedit")
+    _SELFEDIT_BRAIN = brain
+
+    if messages is None:
+        # Fresh start: reset the workspace and build the opening message list.
+        _selfedit_reset()                            # fresh copy of the live tree for this session
+        os.makedirs(_SELFEDIT_WORKSPACE, exist_ok=True)
+        try:
+            open(_SELFEDIT_TASK_FILE, "w").write(task or "")   # for the promote commit message
+        except OSError:
+            pass
+        _SELFEDIT_MESSAGES = [
+            {"role": "system",
+             "content": f"You are the {NAME} coding specialist ({brain}). " + _SELF_EDIT_GUIDE},
+        ]
+        if task:
+            _SELFEDIT_MESSAGES.append({"role": "user", "content": task})
+        _SELFEDIT_ACTIVE = True
+    else:
+        # Continuation: append this turn's user message to the accumulated history.
+        if task:
+            _SELFEDIT_MESSAGES.append({"role": "user", "content": task})
+        _SELFEDIT_MESSAGES = messages
+
+    final_text, returned_messages, _built, _outcome = _agent_loop(
+        brain, _SELFEDIT_MESSAGES, SELF_EDIT_TOOLS, checkpoint=True, tag="selfedit")
+
+    # Update the stored messages so the next continuation appends after this turn.
+    _SELFEDIT_MESSAGES = returned_messages
+
     pending = _selfedit_changed_files()          # XORICS-FEATURE: self-edit (approval gate)
     if pending:
         final_text += ("\n\n[Verified change staged: " + ", ".join(pending) + ". Review and apply "
                        "it to the live repo with /promote, or throw it away with /discard.]")
-    dropped = _selfedit_incomplete(task, pending)   # XORICS-FEATURE: self-edit (completeness gate)
+    dropped = _selfedit_incomplete(task or "", pending)   # XORICS-FEATURE: self-edit (completeness gate)
     if dropped:
         final_text += ("\n\n=== INCOMPLETE EDIT (named target not written) ===\n"
                        "The task named " + ", ".join(dropped) + " as an edit target, but only "
@@ -2102,7 +2149,30 @@ if __name__ == "__main__":
                 if not q:
                     continue
             elif q == "/reset" or q == "/new":
-                reset_history(); print("→ conversation cleared — fresh context\n")
+                reset_history()
+                # Also exit any ongoing self-edit session (module-level names, no 'global' needed).
+                xorics._SELFEDIT_ACTIVE = False
+                xorics._SELFEDIT_MESSAGES = []
+                xorics._SELFEDIT_BRAIN = xorics.CODER
+                print("→ conversation cleared — fresh context\n")
+                continue
+            elif q == "/cancel":                                # XORICS-FEATURE: self-edit
+                if not xorics._SELFEDIT_ACTIVE:
+                    print("not in a self-edit session.\n")
+                else:
+                    xorics._SELFEDIT_ACTIVE = False
+                    xorics._SELFEDIT_MESSAGES = []
+                    xorics._SELFEDIT_BRAIN = xorics.CODER
+                    print("self-edit session paused. Use /promote or /discard to resolve "
+                          "the staged change, or /selfedit <task> to start a new one.\n")
+                continue
+            # If a self-edit session is active, feed all input back into it so the
+            # model sees the full conversation instead of cold-starting from scratch.
+            # XORICS-FEATURE: self-edit (continuation)
+            elif xorics._SELFEDIT_ACTIVE:
+                ans = xorics.run_self_edit(task=q, brain=xorics._SELFEDIT_BRAIN,
+                                          messages=xorics._SELFEDIT_MESSAGES)
+                print(f"\n{NAME.lower()}>", ans, "\n")
                 continue
             elif q == "/selfedit" or q.startswith("/selfedit "):   # XORICS-FEATURE: self-edit
                 task = q[9:].strip()
