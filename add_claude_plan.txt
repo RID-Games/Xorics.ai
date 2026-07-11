@@ -1,0 +1,13 @@
+1. Design sketch
+- utils/claude_fable.py: wrapper around Claude‑Fable API
+- config: read CLAUDE_FABLE_API_KEY from env or config.yaml
+- CLI hook: `check <file>` command
+- Test: mock HTTP call, verify payload, response extraction, error handling
+- requirements.txt: add requests
+
+2. Implementation steps
+- Add utils/claude_fable.py with function check_with_claude_fable(text)
+- Update main.py to add check subcommand
+- Add tests/test_claude_fable.py
+- Update requirements.txt
+- Run tests
