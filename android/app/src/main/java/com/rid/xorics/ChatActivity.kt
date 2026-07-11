@@ -135,6 +135,7 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
     var chats by remember { mutableStateOf<List<Bridge.ChatMeta>>(emptyList()) }
     var watcherJob by remember { mutableStateOf<Job?>(null) }
     val listState = rememberLazyListState()
+    var currentMode by remember { mutableStateOf(SendMode.CHAT) }
 
     // Permission card state (APP-B2). perms is only ever what the bridge last said.
     var perms by remember { mutableStateOf<Bridge.Perms?>(null) }
@@ -262,9 +263,10 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
     }
 
     fun send() {
-        val text = input.trim()
+        val text = (currentMode.prefix + input.trim()).trim()
         val id = chatId
-        if (text.isEmpty() || id == null || sending) return
+        if (id == null || sending) return
+        if (text.isEmpty() || text == currentMode.prefix) return
         input = ""
         val baseline = messages.size  // index the user row will occupy in server truth
         messages.add(Bridge.Msg("user", text))
@@ -435,7 +437,9 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
                 value = input,
                 onValue = { input = it },
                 onSend = { send() },
-                enabled = !sending && chatId != null
+                enabled = !sending && chatId != null,
+                currentMode = currentMode,
+                onModeChange = { currentMode = it },
             )
         }
     }

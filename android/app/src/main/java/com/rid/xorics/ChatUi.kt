@@ -1,22 +1,109 @@
 package com.rid.xorics
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+
+/** Mode presets that prepend command prefixes before the message. */
+enum class SendMode(val label: String, val prefix: String) {
+    CHAT("Chat", "/chat "),
+    POWER("Power", "/power "),
+    CODE("Code", "/code "),
+    PLAN("Plan", "/plan ");
+}
+
+/** The input row at the bottom of the chat screen. Shows a mode dropdown on the left
+ *  and the text field + send button on the right. The selected mode prefix is prepended
+ *  to the message on send so xorics.ask() routes it to the right brain. */
+@Composable
+fun InputBar(
+    value: String,
+    onValue: (String) -> Unit,
+    onSend: () -> Unit,
+    enabled: Boolean,
+    currentMode: SendMode,
+    onModeChange: (SendMode) -> Unit,
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+
+    Surface(tonalElevation = 2.dp) {
+        Row(
+            Modifier.fillMaxWidth().padding(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Mode selector — left side
+            Column {
+                TextButton(
+                    onClick = { menuOpen = true },
+                    enabled = enabled,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = currentMode.label,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (enabled) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                    )
+                }
+                DropdownMenu(
+                    expanded = menuOpen,
+                    onDismissRequest = { menuOpen = false }
+                ) {
+                    SendMode.entries.forEach { mode ->
+                        DropdownMenuItem(
+                            text = { Text(mode.label) },
+                            onClick = {
+                                onModeChange(mode)
+                                menuOpen = false
+                            }
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.width(8.dp))
+
+            // Text field + send
+            OutlinedTextField(
+                value = value,
+                onValueChange = onValue,
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("Message Xorics") },
+                maxLines = 5,
+                enabled = enabled,
+                shape = RoundedCornerShape(24.dp),
+            )
+            Spacer(Modifier.width(8.dp))
+            Button(
+                onClick = onSend,
+                enabled = enabled && value.isNotBlank()
+            ) {
+                Text("Send")
+            }
+        }
+    }
+}
 
 @Composable
 fun MessageBubble(m: Bridge.Msg) {
@@ -39,28 +126,6 @@ fun MessageBubble(m: Bridge.Msg) {
                 color = textColor,
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
             )
-        }
-    }
-}
-
-@Composable
-fun InputBar(value: String, onValue: (String) -> Unit, onSend: () -> Unit, enabled: Boolean) {
-    Surface(tonalElevation = 2.dp) {
-        Row(
-            Modifier.fillMaxWidth().padding(8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            OutlinedTextField(
-                value = value,
-                onValueChange = onValue,
-                modifier = Modifier.weight(1f),
-                placeholder = { Text("Message Xorics") },
-                maxLines = 5
-            )
-            Spacer(Modifier.width(8.dp))
-            Button(onClick = onSend, enabled = enabled && value.isNotBlank()) {
-                Text("Send")
-            }
         }
     }
 }
