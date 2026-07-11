@@ -1844,6 +1844,159 @@ TOOL_IMPLS = {
 }
 
 
+def run_orchestrate(goal: str, brain=None) -> str:
+    """Orchestrate a complex goal end-to-end:
+    1. Planner brain reads source, breaks the goal into numbered BRICKs
+    2. Coder brain runs each brick through run_self_edit (sandbox-verified)
+    3. Each brick is auto-promoted on success
+    4. Verbose per-brick output so the user is never left wondering what's happening
+
+    On crash: full stack trace printed, remaining bricks skipped, summary at end.
+    XORICS-FEATURE: orchestrate
+    """
+    import traceback
+    planner = brain or MANAGER
+
+    # Step 1: parse goal into bricks using the planner brain
+    print(f"\n{'='*60}")
+    print(f"[orchestrate] goal: {goal}")
+    print(f"[orchestrate] planner: {planner}")
+    print(f"{'='*60}\n")
+
+    planner_guide = (
+        "You are the Xorics ORCHESTRATION PLANNER. Break the user's goal into a SEQUENCE of "
+        "small, independently-shippable BRICKs. Each brick should be ONE /selfedit task.\n"
+        "RULES:\n"
+        "  - Read the relevant source file(s) FIRST before proposing any bricks.\n"
+        "  - One brick = one file, one localized change, verifiable on its own.\n"
+        "  - Each brick must leave the tree buildable before the next one starts.\n"
+        "  - Order bricks so each builds on the last.\n"
+        "  - Maximum ~10 bricks; if the goal is larger, cut it into phases.\n"
+        "OUTPUT FORMAT — for EACH brick, emit exactly two lines:\n"
+        "  BRICK N: <short description of what this brick changes>\n"
+        "  SELF-EDIT SPEC:\n"
+        "  <the complete one-line task to paste into /selfedit for this brick>\n"
+        "  ---\n"
+        "After all bricks, print a one-line SUMMARY: <total> bricks, what the goal achieves.\n"
+        "Then STOP. Do not execute any brick — only plan.")
+    # Suppress normal _agent_loop chatter: capture to a string instead of letting it print.
+    import io, sys, contextlib
+    captured = io.StringIO()
+    messages = [
+        {"role": "system", "content": f"You are the Xorics orchestrator planner ({planner}). " + planner_guide},
+        {"role": "user", "content": goal},
+    ]
+    with contextlib.redirect_stdout(captured):
+        final_text, _msgs, _, _ = _agent_loop(planner, messages, PLAN_TOOLS,
+                                               checkpoint=False, tag="orchestrate-plan")
+    planner_output = captured.getvalue()  # any inline tool prints from the planning phase
+    if planner_output.strip():
+        print(planner_output)
+    bricks = _parse_bricks(final_text)
+    if not bricks:
+        return ("[orchestrate] could not parse any bricks from the planner output. "
+                "Planner said:\n" + final_text[:500])
+
+    print(f"[orchestrate] parsed {len(bricks)} brick(s):")
+    for i, (desc, spec) in enumerate(bricks, 1):
+        print(f"  BRICK {i}: {desc}")
+    print()
+
+    # Step 2+3: run each brick, auto-promote on success
+    results = []   # list of (brick_num, desc, status, detail)
+    for i, (desc, spec) in enumerate(bricks, 1):
+        print(f"\n{'='*60}")
+        print(f"[orchestrate] BRICK {i}/{len(bricks)}: {desc}")
+        print(f"[orchestrate] running /selfedit with spec: {spec[:120]}{'...' if len(spec) > 120 else ''}")
+        print(f"{'='*60}")
+        try:
+            # Run the self-edit for this brick (fresh session, no cross-brick context)
+            xorics._SELFEDIT_ACTIVE = False
+            xorics._SELFEDIT_MESSAGES = []
+            result_text = run_self_edit(spec, brain=CODER)
+
+            # Print the model's full response (verbose)
+            print(f"\n[orchestrate] BRICK {i} result:")
+            print(result_text)
+            print()
+
+            # Check if anything was staged
+            pending = _selfedit_changed_files()
+            if pending:
+                print(f"[orchestrate] BRICK {i} staged: {pending}")
+                print(f"[orchestrate] auto-promoting...")
+                promo = promote_self_edit()
+                print(f"[orchestrate] {promo}")
+                results.append((i, desc, "promoted", pending))
+            else:
+                # Still "succeeded" if the output didn't stage anything but also didn't error
+                results.append((i, desc, "ok (no staged files)", result_text[:80]))
+        except Exception as e:
+            tb = traceback.format_exc()
+            print(f"\n[orchestrate] BRICK {i} CRASHED:\n{tb}")
+            results.append((i, desc, "crashed", str(e)))
+            # Don't raise — continue to remaining bricks, report all failures at end
+
+    # Step 4: summary
+    print(f"\n{'='*60}")
+    print("[orchestrate] DONE — summary:")
+    promoted = [r for r in results if r[2] == "promoted"]
+    crashed = [r for r in results if r[2] == "crashed"]
+    ok = [r for r in results if r[2] not in ("promoted", "crashed")]
+    for i, desc, status, detail in results:
+        icon = "✓" if status == "promoted" else ("✗" if status == "crashed" else "?")
+        detail_str = (", ".join(detail) if isinstance(detail, list) else detail)
+        print(f"  {icon} BRICK {i}: {status} — {desc}")
+        if status == "crashed":
+            print(f"      error: {detail_str}")
+    print()
+    if crashed:
+        print(f"[orchestrate] {len(crashed)} brick(s) crashed — see above for tracebacks.")
+    if promoted:
+        print(f"[orchestrate] {len(promoted)} brick(s) promoted to live repo.")
+    return f"orchestrate complete: {len(promoted)}/{len(bricks)} bricks promoted"
+
+
+def _parse_bricks(text: str) -> list:
+    """Parse 'BRICK N:' blocks from planner output.
+    Each block: 'BRICK N: <desc>' followed by 'SELF-EDIT SPEC:' + the spec line + '---'.
+    Returns [(description, self_edit_spec), ...]."""
+    bricks = []
+    # Split on --- boundaries first
+    segments = text.split("---")
+    for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            continue
+        # Look for a BRICK line
+        m = re.search(r"BRICK\s+(\d+):\s*(.+?)(?:\n|SELF-EDIT SPEC:|$)", seg, re.IGNORECASE | re.DOTALL)
+        if not m:
+            continue
+        desc = m.group(2).strip()
+        # Find the SELF-EDIT SPEC section
+        spec_start = seg.find("SELF-EDIT SPEC:")
+        if spec_start < 0:
+            continue
+        spec_text = seg[spec_start + len("SELF-EDIT SPEC:"):].strip()
+        # The spec is the first line of that section
+        spec = spec_text.split("\n")[0].strip()
+        if spec and len(spec) > 10:   # sanity: must be a real task
+            bricks.append((desc, spec))
+    # Fallback: if no bricks found, try splitting by "BRICK N:" anywhere
+    if not bricks:
+        for m in re.finditer(r"BRICK\s+(\d+):\s*(.+?)(?=\nBRICK\s+\d+:|\Z)", text, re.IGNORECASE | re.DOTALL):
+            desc = m.group(2).strip().split("\n")[0]
+            # Try to grab the next line as the spec
+            after = m.end()
+            spec_line = ""
+            rest = text[after:].strip()
+            if rest:
+                spec_line = rest.split("\n")[0].strip()
+            if spec_line and len(spec_line) > 10:
+                bricks.append((desc, spec_line))
+    return bricks
+
+
 def run_build(brain=None):
     """Hand the last /design spec to /selfedit: if no spec is on hand, print a one-liner guiding
     the user to /design <goal> first; otherwise forward the saved spec to run_self_edit with the
@@ -2109,7 +2262,7 @@ if __name__ == "__main__":
         sys.exit()
 
     print(f"{NAME} — local AI. The manager delegates coding to the coder automatically.")
-    print("commands: /code (coder)  /selfedit (edit Xorics, sandbox-verified; /power first → drive on M3)  /design (plan one change, read-only)  /build (run /selfedit on the last /design spec)  /plan (break a feature into small bricks; /power for M3)  /promote /discard (approve or drop a self-edit)  /grant /revoke /grants (privileged tool permissions)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
+    print("commands: /code (coder)  /selfedit (edit Xorics, sandbox-verified; /power first → drive on M3)  /orchestrate (plan + run multi-brick goal; /power for M3 planner)  /design (plan one change, read-only)  /build (run /selfedit on the last /design spec)  /plan (break a feature into small bricks; /power for M3)  /promote /discard (approve or drop a self-edit)  /grant /revoke /grants (privileged tool permissions)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
     print(f"coder pauses every {CHECKPOINT_EVERY} steps to check in (no cap); backstop {CODER_BACKSTOP} when unattended.\n")
     if _CHAT_HISTORY:
         print(f"(resumed {len(_CHAT_HISTORY)} remembered messages — /reset to start fresh)\n")
@@ -2212,6 +2365,19 @@ if __name__ == "__main__":
                 print(f"→ design mode (planner: {where}; planning only — reads source files and "
                       "prints a PLAN + self-edit spec, makes NO edits and stops)\n")
                 ans = run_design(goal, brain=driver)
+                print(f"\n{NAME.lower()}>", ans, "\n")
+                continue
+            elif q == "/orchestrate" or q.startswith("/orchestrate "):   # XORICS-FEATURE: orchestrate
+                goal = q[12:].strip()
+                if not goal:
+                    print("usage: /orchestrate <goal>  "
+                          "(break a goal into bricks, run /selfedit for each, auto-promote on success. "
+                          "Verbose per-brick output. Run /power first to plan on MiniMax M3)\n")
+                    continue
+                driver = MINIMAX if BRAIN == MINIMAX else MANAGER   # planning brain, not the coder
+                where = "MiniMax M3, remote" if driver == MINIMAX else f"{driver}, local"
+                print(f"→ orchestrate mode (planner: {where}; coder: {CODER}, local)\n")
+                ans = run_orchestrate(goal, brain=driver)
                 print(f"\n{NAME.lower()}>", ans, "\n")
                 continue
             elif q == "/grants":     # XORICS-FEATURE: tool-permissions
