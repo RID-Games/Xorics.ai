@@ -1,10 +1,10 @@
 package com.rid.xorics
 
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -34,58 +34,55 @@ enum class SendMode(val label: String, val prefix: String) {
     PLAN("Plan", "/plan ");
 }
 
-/** The input row at the bottom of the chat screen. Shows a mode dropdown on the left
- *  and the text field + send button on the right. The selected mode prefix is prepended
- *  to the message on send so xorics.ask() routes it to the right brain. */
+/** A thin horizontal toolbar above the input bar. The mode dropdown lives on the left;
+ * room for additional tool buttons to be added to the right. */
 @Composable
-fun InputBar(
-    value: String,
-    onValue: (String) -> Unit,
-    onSend: () -> Unit,
-    enabled: Boolean,
+fun ChatToolbar(
     currentMode: SendMode,
     onModeChange: (SendMode) -> Unit,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
 
+    Surface(tonalElevation = 1.dp) {
+        Row(
+            modifier = Modifier.fillMaxWidth().height(40.dp).padding(horizontal = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            TextButton(onClick = { menuOpen = true }) {
+                Text(
+                    text = currentMode.label,
+                    style = MaterialTheme.typography.labelMedium,
+                )
+            }
+            DropdownMenu(
+                expanded = menuOpen,
+                onDismissRequest = { menuOpen = false }
+            ) {
+                SendMode.entries.forEach { mode ->
+                    DropdownMenuItem(
+                        text = { Text(mode.label) },
+                        onClick = {
+                            onModeChange(mode)
+                            menuOpen = false
+                        }
+                    )
+                }
+            }
+
+            // Spacer — other toolbar items can go here
+            Spacer(Modifier.weight(1f))
+        }
+    }
+}
+
+/** The message input row at the bottom of the chat screen. */
+@Composable
+fun InputBar(value: String, onValue: (String) -> Unit, onSend: () -> Unit, enabled: Boolean) {
     Surface(tonalElevation = 2.dp) {
         Row(
             Modifier.fillMaxWidth().padding(8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Mode selector — left side
-            Column {
-                TextButton(
-                    onClick = { menuOpen = true },
-                    enabled = enabled,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = currentMode.label,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = if (enabled) MaterialTheme.colorScheme.primary
-                                else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
-                    )
-                }
-                DropdownMenu(
-                    expanded = menuOpen,
-                    onDismissRequest = { menuOpen = false }
-                ) {
-                    SendMode.entries.forEach { mode ->
-                        DropdownMenuItem(
-                            text = { Text(mode.label) },
-                            onClick = {
-                                onModeChange(mode)
-                                menuOpen = false
-                            }
-                        )
-                    }
-                }
-            }
-
-            Spacer(Modifier.width(8.dp))
-
-            // Text field + send
             OutlinedTextField(
                 value = value,
                 onValueChange = onValue,

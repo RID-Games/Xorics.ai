@@ -433,13 +433,15 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
                 )
             }
+            ChatToolbar(
+                currentMode = currentMode,
+                onModeChange = { currentMode = it },
+            )
             InputBar(
                 value = input,
                 onValue = { input = it },
                 onSend = { send() },
                 enabled = !sending && chatId != null,
-                currentMode = currentMode,
-                onModeChange = { currentMode = it },
             )
         }
     }
