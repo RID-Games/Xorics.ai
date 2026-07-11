@@ -1904,36 +1904,45 @@ def run_orchestrate(goal: str, brain=None) -> str:
 
     # Step 2+3: run each brick, auto-promote on success
     results = []   # list of (brick_num, desc, status, detail)
+    verbose_lines = []  # accumulated output to return to the caller (bridge / phone app)
     for i, (desc, spec) in enumerate(bricks, 1):
-        print(f"\n{'='*60}")
-        print(f"[orchestrate] BRICK {i}/{len(bricks)}: {desc}")
-        print(f"[orchestrate] running /selfedit with spec: {spec[:120]}{'...' if len(spec) > 120 else ''}")
-        print(f"{'='*60}")
+        banner = (f"\n{'='*60}\n"
+                  f"[orchestrate] BRICK {i}/{len(bricks)}: {desc}\n"
+                  f"[orchestrate] running /selfedit with spec: {spec[:120]}{'...' if len(spec) > 120 else ''}\n"
+                  f"{'='*60}\n")
+        print(banner)
+        verbose_lines.append(banner)
         try:
             # Run the self-edit for this brick (fresh session, no cross-brick context)
             xorics._SELFEDIT_ACTIVE = False
             xorics._SELFEDIT_MESSAGES = []
             result_text = run_self_edit(spec, brain=CODER)
 
-            # Print the model's full response (verbose)
-            print(f"\n[orchestrate] BRICK {i} result:")
-            print(result_text)
-            print()
+            # Print the model's full response (verbose) and accumulate it
+            brick_result = f"\n[orchestrate] BRICK {i} result:\n{result_text}\n"
+            print(brick_result)
+            verbose_lines.append(brick_result)
 
             # Check if anything was staged
             pending = _selfedit_changed_files()
             if pending:
-                print(f"[orchestrate] BRICK {i} staged: {pending}")
-                print(f"[orchestrate] auto-promoting...")
                 promo = promote_self_edit()
-                print(f"[orchestrate] {promo}")
+                promo_line = f"[orchestrate] BRICK {i} staged: {pending}\n[orchestrate] auto-promoting...\n[orchestrate] {promo}\n"
+                print(promo_line)
+                verbose_lines.append(promo_line)
                 results.append((i, desc, "promoted", pending))
             else:
                 # Still "succeeded" if the output didn't stage anything but also didn't error
+                ok_line = f"[orchestrate] BRICK {i}: ok (no staged files)\n"
+                print(ok_line)
+                verbose_lines.append(ok_line)
                 results.append((i, desc, "ok (no staged files)", result_text[:80]))
         except Exception as e:
-            tb = traceback.format_exc()
-            print(f"\n[orchestrate] BRICK {i} CRASHED:\n{tb}")
+            import traceback as _tb
+            tb = _tb.format_exc()
+            crash_lines = (f"\n[orchestrate] BRICK {i} CRASHED:\n{tb}\n")
+            print(crash_lines)
+            verbose_lines.append(crash_lines)
             results.append((i, desc, "crashed", str(e)))
             # Don't raise — continue to remaining bricks, report all failures at end
 
@@ -1954,7 +1963,11 @@ def run_orchestrate(goal: str, brain=None) -> str:
         print(f"[orchestrate] {len(crashed)} brick(s) crashed — see above for tracebacks.")
     if promoted:
         print(f"[orchestrate] {len(promoted)} brick(s) promoted to live repo.")
-    return f"orchestrate complete: {len(promoted)}/{len(bricks)} bricks promoted"
+    # Return the full verbose output so bridge.py / the phone app sees everything
+    verbose_summary = "\n".join(verbose_lines)
+    return verbose_summary + (
+        f"\n\norchestrate complete: {len(promoted)}/{len(bricks)} bricks promoted — "
+        f"{len(crashed)} failed. Run 'git log --oneline -5' on the server to review commits.")
 
 
 def _parse_bricks(text: str) -> list:
