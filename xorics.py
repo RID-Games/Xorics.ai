@@ -240,7 +240,7 @@ def see_image(path: str, question: str = "Describe this image in detail.") -> st
 
 
 # ---- read a local text file (hand the coder a long prompt/spec by path) -------
-def read_file(path: str, max_chars: int = 200000) -> str:
+def read_file(path: str, max_chars: int = 200000, start_line: int = 1) -> str:
     """Read a local UTF-8 text file and return its contents, so a long prompt, spec, pin map,
     notes file, or a whole SOURCE FILE can be handed to a model by PATH instead of pasted. Output
     is capped at max_chars so a huge file can't blow the context window; the default is large enough
@@ -267,10 +267,13 @@ def read_file(path: str, max_chars: int = 200000) -> str:
         data = fp.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         return f"Could not read {path}: {e}"
+    if start_line > 1:
+        data = "\n".join(data.splitlines()[start_line - 1:])
     n = len(data)
     if n > max_chars:
         data = data[:max_chars] + f"\n...[truncated at {max_chars} of {n} chars]"
-    return f"----- contents of {fp} -----\n{data}"
+    hdr = f"----- contents of {fp}" + (f" (from line {start_line})" if start_line > 1 else "") + " -----"
+    return hdr + "\n" + data
 
 
 # ---- self-edit: write a repo file into a sandbox COPY and verify it -----------
@@ -779,8 +782,21 @@ TOOLS = [
             "max_chars": {"type": "integer", "description": "Max characters to return (default "
                           "200000, enough to hold a whole source file). If the output ends in a "
                           "[truncated...] marker you do NOT have the whole file -- raise max_chars "
-                          "and re-read before editing it."}},
+                          "and re-read before editing it."},
+            "start_line": {"type": "integer", "description": "1-based line number to start "
+                           "reading from (default 1). Use after grep_file to read just a region "
+                           "instead of the whole file."}},
             "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "grep_file",
+        "description": "Search a repo text file for a case-sensitive substring and return the "
+                       "matching lines with their line numbers (max 40 shown). Use this to find "
+                       "WHERE something lives, then call read_file with start_line and a small "
+                       "max_chars to read just that region -- never read a huge file whole.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "File path; repo-relative names allowed."},
+            "pattern": {"type": "string", "description": "Case-sensitive substring to find."}},
+            "required": ["path", "pattern"]}}},
     {"type": "function", "function": {
         "name": "delegate_to_coder",
         "description": "Hand a firmware/coding task to the specialist coder brain. It researches "
@@ -837,7 +853,7 @@ TOOLS = [
 # Manager (gpt-oss) routes + delegates; it does NOT compile directly.
 MANAGER_TOOLS = [t for t in TOOLS if t["function"]["name"]
                  in ("web_search", "see_image", "search_datasheets", "delegate_to_coder",
-                     "finalize_design", "geocode", "show_route", "clear_route", "read_file")]
+                     "finalize_design", "geocode", "show_route", "clear_route", "read_file", "grep_file")]
 # Coder's own toolset (used inside delegate_to_coder and in manual /code mode).
 CODER_TOOLS = [t for t in TOOLS if t["function"]["name"]
                in ("compile_check", "check_circuit_file", "validate_circuit",
@@ -1937,8 +1953,35 @@ def android_deploy():
         return "DEPLOY ERROR: " + type(e).__name__ + ": " + str(e)
 
 
+def grep_file(path, pattern):
+    """Find WHERE something lives in a file: matching lines with line numbers (max 40 shown).
+    Pair with read_file(start_line=..., max_chars=...) to read just that region instead of the
+    whole file. XORICS-FEATURE: grep-file"""
+    from pathlib import Path as _P
+    fp = _P(path).expanduser()
+    if not fp.exists():
+        alt = _P(REPO_ROOT) / fp.name
+        if alt.exists() and not alt.is_dir():
+            fp = alt
+        else:
+            return "NO FILE at " + path + " — use the repo-relative name."
+    if fp.is_dir():
+        return path + " is a directory, not a file."
+    try:
+        text = fp.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return "Could not read " + path + ": " + str(e)
+    hits = [str(i) + ": " + line for i, line in enumerate(text.splitlines(), 1) if pattern in line]
+    if not hits:
+        return "NO MATCHES for " + pattern + " in " + str(fp)
+    shown = hits[:40]
+    return ("MATCHES in " + str(fp) + " (" + str(len(hits)) + " total, showing first "
+            + str(len(shown)) + "):\n" + "\n".join(shown))
+
+
 TOOL_IMPLS["finalize_design"] = finalize_design   # register now that it's defined
 TOOL_IMPLS["android_deploy"] = android_deploy
+TOOL_IMPLS["grep_file"] = grep_file
 
 def _append_manifest_footer(text, outcome, deliv_before):
     """Machine-generated truth footer. Fires only on design turns, reporting whether a board actually
