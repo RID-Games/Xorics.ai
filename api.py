@@ -139,6 +139,10 @@ def make_router(run_ask_full, auth):
             store.rename_chat(chat_id, body["title"])
         if "project_id" in body:
             store.move_chat(chat_id, _loose(body["project_id"]))
+        elif "folder" in body:
+            # Resolve folder path to project_id and move the chat there
+            pid = store.get_project_by_folder(body["folder"])
+            store.move_chat(chat_id, pid)
         if "archived" in body:
             store.set_archived(chat_id, bool(body["archived"]))
         return store.get_chat(chat_id)

@@ -86,7 +86,7 @@ object Bridge {
     data class Msg(val role: String, val content: String)
 
     /** Summary of a stored chat — used for the chat list. */
-    data class ChatMeta(val id: String, val title: String, val updatedAt: Double)
+    data class ChatMeta(val id: String, val title: String, val updatedAt: Double, val projectId: String?, val folder: String)
 
     /** Send recorded audio bytes, get back the transcript. */
     fun stt(audio: ByteArray): String {
@@ -166,7 +166,11 @@ object Bridge {
             val out = ArrayList<ChatMeta>(arr.length())
             for (i in 0 until arr.length()) {
                 val c = arr.getJSONObject(i)
-                out.add(ChatMeta(c.getString("id"), c.getString("title"), c.getDouble("updated_at")))
+                out.add(ChatMeta(
+                    c.getString("id"), c.getString("title"), c.getDouble("updated_at"),
+                    if (c.has("project_id") && !c.isNull("project_id")) c.getString("project_id") else null,
+                    if (c.has("folder")) c.getString("folder") else "/"
+                ))
             }
             return out
         }
@@ -270,6 +274,35 @@ object Bridge {
         val req = auth(Request.Builder().url("$BASE/v1/chats/$id")).delete().build()
         client.newCall(req).execute().use { r ->
             if (!r.isSuccessful) throw IOException("deleteChat ${r.code}: ${r.body?.string().orEmpty().take(160)}")
+        }
+    }
+
+    /**
+     * Move a chat into a project/folder. Pass null project_id to make it loose
+     * (appear in the root chat list). The server resolves the folder path to a
+     * project_id automatically.
+     */
+    fun moveChat(chatId: String, projectId: String?) {
+        val payload = if (projectId != null)
+            JSONObject().put("project_id", projectId)
+        else
+            JSONObject().put("project_id", JSONObject.NULL)
+        val req = auth(Request.Builder().url("$BASE/v1/chats/$chatId"))
+            .patch(payload.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        client.newCall(req).execute().use { r ->
+            if (!r.isSuccessful) throw IOException("moveChat ${r.code}: ${r.body?.string().orEmpty().take(160)}")
+        }
+    }
+
+    /** Move a chat to a folder by path (server resolves folder -> project_id). */
+    fun moveChatByFolder(chatId: String, folder: String) {
+        val payload = JSONObject().put("folder", folder)
+        val req = auth(Request.Builder().url("$BASE/v1/chats/$chatId"))
+            .patch(payload.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        client.newCall(req).execute().use { r ->
+            if (!r.isSuccessful) throw IOException("moveChatByFolder ${r.code}: ${r.body?.string().orEmpty().take(160)}")
         }
     }
 

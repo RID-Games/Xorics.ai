@@ -177,6 +177,14 @@ def get_project(pid: str):
         return _row(c.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone())
 
 
+def get_project_by_folder(folder: str) -> str | None:
+    """Resolve a folder path to its project id, or None if no such project exists."""
+    f = _norm_folder(folder)
+    with _conn() as c:
+        r = c.execute("SELECT id FROM projects WHERE folder=?", (f,)).fetchone()
+        return r["id"] if r else None
+
+
 def list_projects() -> list:
     with _conn() as c:
         return _rows(c.execute("SELECT * FROM projects ORDER BY updated_at DESC").fetchall())
@@ -225,17 +233,22 @@ def list_chats(project_id=_UNSET, include_archived: bool = False) -> list:
     cond, vals = [], []
     if project_id is not _UNSET:
         if project_id is None:
-            cond.append("project_id IS NULL")
+            cond.append("chats.project_id IS NULL")
         else:
-            cond.append("project_id=?"); vals.append(project_id)
+            cond.append("chats.project_id=?"); vals.append(project_id)
     if not include_archived:
-        cond.append("archived=0")
-    q = "SELECT * FROM chats"
+        cond.append("chats.archived=0")
+    q = """SELECT chats.*, projects.folder AS _folder
+           FROM chats
+           LEFT JOIN projects ON chats.project_id = projects.id"""
     if cond:
         q += " WHERE " + " AND ".join(cond)
-    q += " ORDER BY updated_at DESC"
+    q += " ORDER BY chats.updated_at DESC"
     with _conn() as c:
-        return _rows(c.execute(q, vals).fetchall())
+        rows = _rows(c.execute(q, vals).fetchall())
+        for r in rows:
+            r["folder"] = r.pop("_folder", None) or "/"
+        return rows
 
 
 def rename_chat(cid: str, title: str) -> dict:

@@ -9,8 +9,11 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
@@ -19,6 +22,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.MoveInOut
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -39,9 +43,14 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -176,6 +185,13 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
     var showEdits by remember { mutableStateOf(false) }
     var editsBusy by remember { mutableStateOf(false) }
     var editsStatus by remember { mutableStateOf("") }
+
+    // Move-chat dialog state (APP-B5).
+    var moveTarget by remember { mutableStateOf<Bridge.ChatMeta?>(null) }
+    var allFolders by remember { mutableStateOf<List<String>>(emptyList()) }
+    var moveDest by remember { mutableStateOf("/") }
+    var moveBusy by remember { mutableStateOf(false) }
+    var moveStatus by remember { mutableStateOf("") }
 
     fun refreshEdits() {
         scope.launch {
@@ -424,36 +440,54 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
                                     }
                                 },
                                 trailingIcon = {
-                                    IconButton(
-                                        onClick = {
-                                            scope.launch {
-                                                withContext(Dispatchers.IO) { Bridge.deleteChat(c.id) }
-                                                chats = withContext(Dispatchers.IO) {
-                                                    try { Bridge.listChats() } catch (_: Exception) { emptyList() }
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        // Move icon — opens folder picker
+                                        IconButton(
+                                            onClick = {
+                                                menuOpen = false
+                                                scope.launch {
+                                                    allFolders = withContext(Dispatchers.IO) { Bridge.listFolders() }
+                                                    moveDest = c.folder
+                                                    moveTarget = c
                                                 }
-                                                // If we deleted the current chat, switch to the first available one
-                                                if (chatId == c.id) {
-                                                    val first = chats.firstOrNull()
-                                                    if (first != null) {
-                                                        context.getSharedPreferences("xorics", Context.MODE_PRIVATE)
-                                                            .edit().putString("chatId", first.id).apply()
-                                                        chatId = first.id
-                                                        messages.clear()
-                                                        status = ""
-                                                    } else {
-                                                        // No chats left — create a new one
-                                                        val newId = withContext(Dispatchers.IO) { Bridge.createChat() }
-                                                        context.getSharedPreferences("xorics", Context.MODE_PRIVATE)
-                                                            .edit().putString("chatId", newId).apply()
-                                                        chatId = newId
-                                                        messages.clear()
-                                                        status = ""
+                                            }
+                                        ) {
+                                            Icon(
+                                                Icons.Default.MoveInOut,
+                                                contentDescription = "Move chat",
+                                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                        // Delete icon
+                                        IconButton(
+                                            onClick = {
+                                                scope.launch {
+                                                    withContext(Dispatchers.IO) { Bridge.deleteChat(c.id) }
+                                                    chats = withContext(Dispatchers.IO) {
+                                                        try { Bridge.listChats() } catch (_: Exception) { emptyList() }
+                                                    }
+                                                    if (chatId == c.id) {
+                                                        val first = chats.firstOrNull()
+                                                        if (first != null) {
+                                                            context.getSharedPreferences("xorics", Context.MODE_PRIVATE)
+                                                                .edit().putString("chatId", first.id).apply()
+                                                            chatId = first.id
+                                                            messages.clear()
+                                                            status = ""
+                                                        } else {
+                                                            val newId = withContext(Dispatchers.IO) { Bridge.createChat() }
+                                                            context.getSharedPreferences("xorics", Context.MODE_PRIVATE)
+                                                                .edit().putString("chatId", newId).apply()
+                                                            chatId = newId
+                                                            messages.clear()
+                                                            status = ""
+                                                        }
                                                     }
                                                 }
                                             }
+                                        ) {
+                                            Icon(Icons.Default.Delete, contentDescription = "Delete chat", tint = MaterialTheme.colorScheme.error)
                                         }
-                                    ) {
-                                        Icon(Icons.Default.Delete, contentDescription = "Delete chat", tint = MaterialTheme.colorScheme.error)
                                     }
                                 }
                             )
@@ -536,6 +570,83 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
             onClose = { showEdits = false }
         )
     }
+
+    if (moveTarget != null) {
+        MoveChatDialog(
+            chat = moveTarget!!,
+            allFolders = allFolders,
+            dest = moveDest,
+            onDestChange = { moveDest = it },
+            busy = moveBusy,
+            status = moveStatus,
+            onMove = {
+                if (moveBusy) return@MoveChatDialog
+                moveBusy = true
+                moveStatus = ""
+                scope.launch {
+                    try {
+                        withContext(Dispatchers.IO) {
+                            Bridge.moveChatByFolder(moveTarget!!.id, moveDest)
+                        }
+                        chats = withContext(Dispatchers.IO) {
+                            try { Bridge.listChats() } catch (_: Exception) { emptyList() }
+                        }
+                        moveTarget = null
+                        moveStatus = ""
+                    } catch (e: Exception) {
+                        moveStatus = "error: ${e.message}"
+                    } finally {
+                        moveBusy = false
+                    }
+                }
+            },
+            onDismiss = { moveTarget = null }
+        )
+    }
 }
 
 
+
+private fun MoveChatDialog(
+    chat: Bridge.ChatMeta,
+    allFolders: List<String>,
+    dest: String,
+    onDestChange: (String) -> Unit,
+    busy: Boolean,
+    status: String,
+    onMove: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        title = { Text("Move \"${chat.title.ifBlank { "Untitled chat" }}\"") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = dest,
+                    onValueChange = onDestChange,
+                    singleLine = true,
+                    label = { Text("Destination folder") },
+                    enabled = !busy
+                )
+                if (allFolders.isNotEmpty()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text("Existing folders:", style = MaterialTheme.typography.bodySmall)
+                    allFolders.forEach { fld ->
+                        TextButton(onClick = { onDestChange(fld) }, enabled = !busy) { Text(fld) }
+                    }
+                }
+                if (status.isNotEmpty()) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(status, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onMove, enabled = !busy) { Text(if (busy) "Moving…" else "Move") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !busy) { Text("Cancel") }
+        }
+    )
+}
