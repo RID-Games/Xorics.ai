@@ -175,6 +175,8 @@ def make_router(run_ask_full, auth):
         user_msg = store.add_message(chat_id, "user", content)
 
         text, built, deliverables = await run_in_threadpool(run_ask_full, content, history)
+        if not text:
+            text = "⚠ Xorics returned an empty response. Try again or rephrase the request."
         asst_msg = store.add_message(chat_id, "assistant", text, built_path=built)
 
         # Mirror any deliverable the coder verified to disk THIS turn into the project file store, so

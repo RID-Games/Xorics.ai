@@ -338,6 +338,13 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
                             confirmedLanded = true
                             status = "thinking…"
                         }
+                        // landed but no assistant reply yet — reconcile so the empty response
+                        // is shown and the thinking spinner clears instead of hanging forever.
+                        server.size == baseline + 1 -> {
+                            reconcile(server)
+                            status = ""
+                            return@launch
+                        }
                         postFailed || server.size != baseline -> {
                             // Our row is missing after the POST gave up, or history diverged
                             // (something else sits where our turn should be). Two consecutive
