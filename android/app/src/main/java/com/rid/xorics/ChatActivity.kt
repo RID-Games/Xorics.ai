@@ -20,9 +20,9 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowForward
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Menu
-import androidx.compose.material.icons.filled.MoveInOut
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -453,7 +453,7 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
                                             }
                                         ) {
                                             Icon(
-                                                Icons.Default.MoveInOut,
+                                                Icons.Default.ArrowForward,
                                                 contentDescription = "Move chat",
                                                 tint = MaterialTheme.colorScheme.onSurfaceVariant
                                             )
@@ -607,6 +607,7 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
 
 
 
+@Composable
 private fun MoveChatDialog(
     chat: Bridge.ChatMeta,
     allFolders: List<String>,
