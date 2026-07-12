@@ -59,6 +59,16 @@ if hasattr(xorics, "_CHAT_HISTORY") and hasattr(xorics, "_load_history"):
 
 _ASK_LOCK = threading.Lock()    # ask() drives one global brain over llama-swap — serialize
 _LAST_ASK = {"text": None, "ts": None}  # last ask through THIS process — xorics.ask() is stateless
+_ASK_LOG = "/tmp/xorics_ask.log"   # trace every ask/response for debugging silent failures
+
+def _log_ask(prompt_preview, response_preview, history_len):
+    """Append a one-line trace of every ask/response to _ASK_LOG for debugging silent failures."""
+    ts = time.strftime("%H:%M:%S")
+    try:
+        with open(_ASK_LOG, "a") as f:
+            f.write(f"[{ts}] hist={history_len} prompt={prompt_preview!r} response={response_preview!r}\n")
+    except OSError:
+        pass
                                         # by contract, so the dashboard agent page reads this, not
                                         # xorics._CHAT_HISTORY (which never updates on bridge asks).
 _TOKEN = os.environ.get("XORICS_BRIDGE_TOKEN")
@@ -128,9 +138,11 @@ def _run_ask_full(text, history=None):
         _LAST_ASK.update(text=text, ts=time.time())   # dashboard agent page (see _LAST_ASK above)
         _deliv_before = len(xorics._load_deliverables())
         r = xorics.ask(text, history=history)
+        text_r = str(r)
+        _log_ask(text[:80], text_r[:200], len(history) if history else 0)
         fresh = [d["path"] for d in xorics._load_deliverables()[_deliv_before:]
                  if os.path.exists(os.path.expanduser(d["path"]))]
-        return str(r), getattr(r, "built_path", None), fresh
+        return text_r, getattr(r, "built_path", None), fresh
 
 
 async def _chat(request: Request):
