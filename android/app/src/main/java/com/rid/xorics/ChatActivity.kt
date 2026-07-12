@@ -17,6 +17,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -397,7 +398,66 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
                             }
                         )
                         HorizontalDivider()
-                        chats.forEach { c -> DropdownMenuItem(text = { Text(c.title.ifBlank { "Untitled chat" }) }, onClick = { menuOpen = false; watcherJob?.cancel(); context.getSharedPreferences("xorics", Context.MODE_PRIVATE).edit().putString("chatId", c.id).apply(); chatId = c.id; scope.launch { val hist = withContext(Dispatchers.IO) { try { Bridge.getMessages(c.id) } catch (_: Exception) { null } }; if (chatId == c.id) { if (hist != null) { messages.clear(); messages.addAll(hist); status = ""; if (messages.isNotEmpty()) listState.scrollToItem(messages.size - 1) } else status = "couldn't load history" } } }) }
+                        chats.forEach { c ->
+                            DropdownMenuItem(
+                                text = { Text(c.title.ifBlank { "Untitled chat" }) },
+                                onClick = {
+                                    menuOpen = false
+                                    watcherJob?.cancel()
+                                    context.getSharedPreferences("xorics", Context.MODE_PRIVATE)
+                                        .edit().putString("chatId", c.id).apply()
+                                    chatId = c.id
+                                    scope.launch {
+                                        val hist = withContext(Dispatchers.IO) {
+                                            try { Bridge.getMessages(c.id) } catch (_: Exception) { null }
+                                        }
+                                        if (chatId == c.id) {
+                                            if (hist != null) {
+                                                messages.clear()
+                                                messages.addAll(hist)
+                                                status = ""
+                                                if (messages.isNotEmpty()) listState.scrollToItem(messages.size - 1)
+                                            } else {
+                                                status = "couldn't load history"
+                                            }
+                                        }
+                                    }
+                                },
+                                trailingIcon = {
+                                    IconButton(
+                                        onClick = {
+                                            scope.launch {
+                                                withContext(Dispatchers.IO) { Bridge.deleteChat(c.id) }
+                                                chats = withContext(Dispatchers.IO) {
+                                                    try { Bridge.listChats() } catch (_: Exception) { emptyList() }
+                                                }
+                                                // If we deleted the current chat, switch to the first available one
+                                                if (chatId == c.id) {
+                                                    val first = chats.firstOrNull()
+                                                    if (first != null) {
+                                                        context.getSharedPreferences("xorics", Context.MODE_PRIVATE)
+                                                            .edit().putString("chatId", first.id).apply()
+                                                        chatId = first.id
+                                                        messages.clear()
+                                                        status = ""
+                                                    } else {
+                                                        // No chats left — create a new one
+                                                        val newId = withContext(Dispatchers.IO) { Bridge.createChat() }
+                                                        context.getSharedPreferences("xorics", Context.MODE_PRIVATE)
+                                                            .edit().putString("chatId", newId).apply()
+                                                        chatId = newId
+                                                        messages.clear()
+                                                        status = ""
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    ) {
+                                        Icon(Icons.Default.Delete, contentDescription = "Delete chat", tint = MaterialTheme.colorScheme.error)
+                                    }
+                                }
+                            )
+                        }
                         if (chats.isNotEmpty()) HorizontalDivider()
                         DropdownMenuItem(
                             text = { Text("Edits") },

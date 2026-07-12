@@ -265,6 +265,14 @@ object Bridge {
         }
     }
 
+    /** Delete a chat and all its messages. */
+    fun deleteChat(id: String) {
+        val req = auth(Request.Builder().url("$BASE/v1/chats/$id")).delete().build()
+        client.newCall(req).execute().use { r ->
+            if (!r.isSuccessful) throw IOException("deleteChat ${r.code}: ${r.body?.string().orEmpty().take(160)}")
+        }
+    }
+
     /** Move a file to another folder; the server relocates the bytes on disk to match. */
     fun moveFile(id: String, folder: String): FileItem {
         val payload = JSONObject().put("folder", folder)
