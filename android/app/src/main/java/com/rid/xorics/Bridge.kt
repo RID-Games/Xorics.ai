@@ -445,4 +445,199 @@ object Bridge {
             return parseSelfEdit(JSONObject(body))
         }
     }
+    // ================= commands API (orchestrate / selfedit / plan / design / build)
+    // Drives the /v1/commands/* routes — the full self-improvement pipeline from Android.
+    // All return raw JSON strings. The typed SelfEdit methods above
+    // (getSelfEdit / promoteSelfEdit / discardSelfEdit) hit /v1/selfedit/* for
+    // structured review; these hit /v1/commands/* to fire the operations themselves.
+
+    /** Start a sandbox-verified self-edit session. */
+    fun runSelfEdit(task: String): String {
+        val payload = JSONObject().put("task", task)
+        val req = auth(Request.Builder().url("$BASE/v1/commands/selfedit"))
+            .post(payload.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        slowClient.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("runSelfEdit ${r.code}: ${body.take(160)}")
+            return body
+        }
+    }
+
+    /** Plan: break a goal into small bricks (read-only, no edits). */
+    fun cmdPlan(goal: String): String {
+        val payload = JSONObject().put("goal", goal)
+        val req = auth(Request.Builder().url("$BASE/v1/commands/plan"))
+            .post(payload.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        client.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("cmdPlan ${r.code}: ${body.take(160)}")
+            return body
+        }
+    }
+
+    /** Design: read-only spec — plan + self-edit spec, makes NO edits. */
+    fun cmdDesign(goal: String): String {
+        val payload = JSONObject().put("goal", goal)
+        val req = auth(Request.Builder().url("$BASE/v1/commands/design"))
+            .post(payload.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        client.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("cmdDesign ${r.code}: ${body.take(160)}")
+            return body
+        }
+    }
+
+    /** Build: run /selfedit on the last /design spec. */
+    fun cmdBuild(): String {
+        val req = auth(Request.Builder().url("$BASE/v1/commands/build"))
+            .post("{}".toRequestBody("application/json".toMediaType()))
+            .build()
+        slowClient.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("cmdBuild ${r.code}: ${body.take(160)}")
+            return body
+        }
+    }
+
+    /** Orchestrate: plan + run multi-brick goal with auto-promote. */
+    fun orchestrate(goal: String): String {
+        val payload = JSONObject().put("goal", goal)
+        val req = auth(Request.Builder().url("$BASE/v1/commands/orchestrate"))
+            .post(payload.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        slowClient.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("orchestrate ${r.code}: ${body.take(160)}")
+            return body
+        }
+    }
+
+    /** Capabilities: what Xorics knows about itself and its tools. */
+    fun capabilities(): String {
+        val req = auth(Request.Builder().url("$BASE/v1/commands/capabilities"))
+            .post("{}".toRequestBody("application/json".toMediaType()))
+            .build()
+        client.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("capabilities ${r.code}: ${body.take(160)}")
+            return body
+        }
+    }
+
+    /** Power mode: switch manager brain to MiniMax M3 (requires MINIMAX_API_KEY on server). */
+    fun cmdPower(): String {
+        val req = auth(Request.Builder().url("$BASE/v1/commands/power"))
+            .post("{}".toRequestBody("application/json".toMediaType()))
+            .build()
+        client.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("cmdPower ${r.code}: ${body.take(160)}")
+            return body
+        }
+    }
+
+    /** Local mode: switch manager brain back to gpt-oss. */
+    fun cmdLocal(): String {
+        val req = auth(Request.Builder().url("$BASE/v1/commands/local"))
+            .post("{}".toRequestBody("application/json".toMediaType()))
+            .build()
+        client.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("cmdLocal ${r.code}: ${body.take(160)}")
+            return body
+        }
+    }
+
+    /** Reset: clear history, exit any active self-edit session. */
+    fun cmdReset(): String {
+        val req = auth(Request.Builder().url("$BASE/v1/commands/reset"))
+            .post("{}".toRequestBody("application/json".toMediaType()))
+            .build()
+        client.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("cmdReset ${r.code}: ${body.take(160)}")
+            return body
+        }
+    }
+
+    /** Cancel: pause the active self-edit session without discarding it. */
+    fun cmdCancel(): String {
+        val req = auth(Request.Builder().url("$BASE/v1/commands/cancel"))
+            .post("{}".toRequestBody("application/json".toMediaType()))
+            .build()
+        client.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("cmdCancel ${r.code}: ${body.take(160)}")
+            return body
+        }
+    }
+
+    /** Skill: search skills. Pass null/blank query to list all. */
+    fun cmdSkill(query: String?): String {
+        val url = if (query.isNullOrBlank()) "$BASE/v1/commands/skill"
+                  else "$BASE/v1/commands/skill?query=" + java.net.URLEncoder.encode(query, "UTF-8")
+        val req = auth(Request.Builder().url(url))
+            .post("{}".toRequestBody("application/json".toMediaType()))
+            .build()
+        client.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("cmdSkill ${r.code}: ${body.take(160)}")
+            return body
+        }
+    }
+
+    /** Promote: re-verify + commit pending self-edit. Use promoteAndPush() to also git-push. */
+    fun promoteRaw(): String {
+        val payload = JSONObject().put("push", false)
+        val req = auth(Request.Builder().url("$BASE/v1/commands/promote"))
+            .post(payload.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        slowClient.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("promoteRaw ${r.code}: ${body.take(160)}")
+            return body
+        }
+    }
+
+    /** Promote and push: commit + git push to origin. */
+    fun promoteAndPush(): String {
+        val payload = JSONObject().put("push", true)
+        val req = auth(Request.Builder().url("$BASE/v1/commands/promote"))
+            .post(payload.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        slowClient.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("promoteAndPush ${r.code}: ${body.take(160)}")
+            return body
+        }
+    }
+
+    /** Discard: throw the pending self-edit away; live tree is untouched. */
+    fun discardRaw(): String {
+        val req = auth(Request.Builder().url("$BASE/v1/commands/discard"))
+            .post("{}".toRequestBody("application/json".toMediaType()))
+            .build()
+        client.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("discardRaw ${r.code}: ${body.take(160)}")
+            return body
+        }
+    }
+
+    /** Status: current Xorics state (brain, plan_mode, selfedit_active, granted tools). */
+    fun cmdStatus(): String {
+        val req = auth(Request.Builder().url("$BASE/v1/commands/status"))
+            .post("{}".toRequestBody("application/json".toMediaType()))
+            .build()
+        client.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw IOException("cmdStatus ${r.code}: ${body.take(160)}")
+            return body
+        }
+    }
+
+
 }
