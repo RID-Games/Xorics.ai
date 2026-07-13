@@ -33,6 +33,7 @@ Config (env, all optional):
 """
 
 import os
+import sys
 import time
 import uuid
 import base64
@@ -43,12 +44,17 @@ _ASK_LOG   = "/tmp/xorics_ask.log"
 import tempfile
 import subprocess
 
+# Add local dir to path so we can import skills and capabilities
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import httpx
+import skills
+import capabilities
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from starlette.concurrency import run_in_threadpool
 
-# import xorics   # REMOVED. Hermes now handles it.
+import xorics   # wired for Android app + voice routing
 _ASK_LOCK  = __import__("threading").Lock()
 _AST_LOCK_USED = True
 
@@ -56,7 +62,7 @@ from api import make_router   # app-facing REST API (projects/chats/messages); s
 from glasses_bus import make_glasses_router   # G2 glasses command/event bus; see glasses_bus.py
 from dashboard_router import make_dashboard_router   # glasses HUD dashboard pages; see dashboard_router.py
 
-# import xorics   # REMOVED - Hermes now handles it
+import xorics   # XORICS-FEATURE: full command system — routes "xorics " prefix to xorics.ask()
 # --- Hermes bridge (replaces xorics) ---------------------------------------------
 import os, pty, select, queue, threading, re
 
@@ -125,6 +131,18 @@ def _auth(request: Request):
 
 
 # --- chat core (OpenAI-compatible) -------------------------------------------
+
+def _is_xorics_request(text: str) -> bool:
+    """True if text starts with 'xorics ' — routes to xorics.ask() command system."""
+    return text.strip().lower().startswith("xorics ")
+
+
+def _xorics_chat(text: str) -> str:
+    """Route XORICS keyword to xorics.ask() for full command system."""
+    result = xorics.ask(text)
+    return str(result)
+
+
 def _extract_user_text(messages):
     """Last user turn -> plain string. Tolerate the multimodal list form."""
     for msg in reversed(messages or []):
@@ -172,7 +190,11 @@ async def _chat(request: Request):
     user_text = _extract_user_text(body.get("messages"))
     if not user_text:
         raise HTTPException(status_code=400, detail="no user message in 'messages'")
-    text = await run_in_threadpool(_run_ask, user_text)
+    # Route "xorics " prefix to the full xorics command system (ask + selfedit, etc.)
+    if _is_xorics_request(user_text):
+        text = await run_in_threadpool(_xorics_chat, user_text)
+    else:
+        text = await run_in_threadpool(_run_ask, user_text)
     return _completion(text, body.get("model"))
 
 
@@ -367,6 +389,18 @@ async def models():
     return {"object": "list", "data": [{"id": "xorics", "object": "model", "owned_by": "rid"}]}
 
 
+@app.get("/v1/skills")
+async def list_skills(request: Request):
+    _auth(request)
+    return {"skills": skills.list_skills()}
+
+
+@app.get("/v1/capabilities")
+async def list_capabilities(request: Request):
+    _auth(request)
+    return {"capabilities": capabilities.self_knowledge()}
+
+
 # --- permission surface ------------------------------------------------------
 # Privileged tools must be explicitly granted before xorics can use them. These
 # three routes let the dashboard (or curl) inspect and toggle the grant set
@@ -463,6 +497,275 @@ def _selfedit_discard():
 async def selfedit_discard(request: Request):
     _auth(request)
     return await run_in_threadpool(_selfedit_discard)
+
+
+# --- XORICS command API (Android app triggers all xorics commands here) -----------
+
+
+def _xorics_cmd_selfedit(task: str):
+    return xorics.run_self_edit(task, brain=xorics.BRAIN)
+
+
+def _xorics_cmd_plan(goal: str):
+    xorics.PLAN_MODE = True
+    return str(xorics.ask(f"/plan {goal}"))
+
+
+def _xorics_cmd_design(goal: str):
+    return xorics.run_design(goal, brain=xorics.BRAIN)
+
+
+def _xorics_cmd_build():
+    return xorics.run_build(brain=xorics.BRAIN)
+
+
+def _xorics_cmd_orchestrate(goal: str):
+    return xorics.run_orchestrate(goal, brain=xorics.BRAIN)
+
+
+def _xorics_cmd_skill(query: str = None):
+    if query:
+        return skills.search_skills(query)
+    return skills.list_skills()
+
+
+def _xorics_cmd_capabilities():
+    return capabilities.self_knowledge()
+
+
+def _xorics_cmd_power():
+    if os.environ.get("MINIMAX_API_KEY"):
+        xorics.BRAIN = xorics.MINIMAX
+        return {"brain": xorics.BRAIN, "status": "power mode active"}
+    return {"error": "MINIMAX_API_KEY not set", "brain": xorics.BRAIN}
+
+
+def _xorics_cmd_local():
+    xorics.BRAIN = xorics.MANAGER
+    xorics.PLAN_MODE = False
+    return {"brain": xorics.BRAIN, "status": "local mode active"}
+
+
+def _xorics_cmd_reset():
+    xorics.reset_history()
+    xorics._SELFEDIT_ACTIVE = False
+    xorics._SELFEDIT_MESSAGES = []
+    xorics._SELFEDIT_BRAIN = xorics.CODER
+    xorics.PLAN_MODE = False
+    return {"status": "reset done"}
+
+
+def _xorics_cmd_cancel():
+    if not xorics._SELFEDIT_ACTIVE:
+        return {"status": "no active self-edit session"}
+    xorics._SELFEDIT_ACTIVE = False
+    xorics._SELFEDIT_MESSAGES = []
+    xorics._SELFEDIT_BRAIN = xorics.CODER
+    return {"status": "self-edit session paused"}
+
+
+def _xorics_cmd_grants():
+    return {
+        "privileged": sorted(xorics._PRIVILEGED_TOOLS),
+        "granted": sorted(xorics._TOOL_GRANTS),
+    }
+
+
+def _xorics_cmd_grant(tool: str):
+    if xorics._grant_tool(tool):
+        return {"tool": tool, "status": "granted"}
+    return {"tool": tool, "error": "not a privileged tool"}
+
+
+def _xorics_cmd_revoke(tool: str):
+    if xorics._revoke_tool(tool):
+        return {"tool": tool, "status": "revoked"}
+    return {"tool": tool, "status": "was not granted"}
+
+
+def _xorics_cmd_promote(message: str = None, push: bool = False):
+    with _ASK_LOCK:
+        status = xorics.promote_self_edit(message=message)
+        if push and status.startswith("PROMOTED"):
+            p = subprocess.run(
+                ["git", "-C", xorics.REPO_ROOT, "push", "origin", "g2-integration"],
+                capture_output=True, text=True,
+                env=dict(os.environ, GIT_TERMINAL_PROMPT="0"),
+            )
+            status += ("\nPUSHED: " if p.returncode == 0 else "\nPUSH FAILED: ") + (
+                p.stderr or p.stdout or ""
+            ).strip()
+        return {"status": status}
+
+
+def _xorics_cmd_discard():
+    with _ASK_LOCK:
+        return {"status": xorics.discard_self_edit()}
+
+
+def _xorics_cmd_status():
+    return {
+        "brain": xorics.BRAIN,
+        "plan_mode": xorics.PLAN_MODE,
+        "selfedit_active": xorics._SELFEDIT_ACTIVE,
+        "_SELFEDIT_ACTIVE": xorics._SELFEDIT_ACTIVE,
+        "manager": xorics.MANAGER,
+        "coder": xorics.CODER,
+        "minimax": xorics.MINIMAX,
+    }
+
+
+# POST /v1/commands/selfedit
+@app.post("/v1/commands/selfedit")
+async def cmd_selfedit(request: Request):
+    _auth(request)
+    body = await request.json()
+    task = body.get("task", "")
+    result = await run_in_threadpool(_xorics_cmd_selfedit, task)
+    return {"result": str(result), "status": "ok"}
+
+
+# POST /v1/commands/plan
+@app.post("/v1/commands/plan")
+async def cmd_plan(request: Request):
+    _auth(request)
+    body = await request.json()
+    goal = body.get("goal", "")
+    result = await run_in_threadpool(_xorics_cmd_plan, goal)
+    return {"result": result, "status": "ok"}
+
+
+# POST /v1/commands/design
+@app.post("/v1/commands/design")
+async def cmd_design(request: Request):
+    _auth(request)
+    body = await request.json()
+    goal = body.get("goal", "")
+    result = await run_in_threadpool(_xorics_cmd_design, goal)
+    return {"result": str(result), "status": "ok"}
+
+
+# POST /v1/commands/build
+@app.post("/v1/commands/build")
+async def cmd_build(request: Request):
+    _auth(request)
+    result = await run_in_threadpool(_xorics_cmd_build)
+    return {"result": str(result), "status": "ok"}
+
+
+# POST /v1/commands/orchestrate
+@app.post("/v1/commands/orchestrate")
+async def cmd_orchestrate(request: Request):
+    _auth(request)
+    body = await request.json()
+    goal = body.get("goal", "")
+    result = await run_in_threadpool(_xorics_cmd_orchestrate, goal)
+    return {"result": str(result), "status": "ok"}
+
+
+# POST /v1/commands/skill
+@app.post("/v1/commands/skill")
+async def cmd_skill(request: Request):
+    _auth(request)
+    body = await request.json()
+    query = body.get("query", "") or None
+    result = await run_in_threadpool(_xorics_cmd_skill, query)
+    return {"result": result, "status": "ok"}
+
+
+# GET /v1/commands/capabilities
+@app.get("/v1/commands/capabilities")
+async def cmd_capabilities(request: Request):
+    _auth(request)
+    result = await run_in_threadpool(_xorics_cmd_capabilities)
+    return {"capabilities": result}
+
+
+# POST /v1/commands/power
+@app.post("/v1/commands/power")
+async def cmd_power(request: Request):
+    _auth(request)
+    result = await run_in_threadpool(_xorics_cmd_power)
+    return result
+
+
+# POST /v1/commands/local
+@app.post("/v1/commands/local")
+async def cmd_local(request: Request):
+    _auth(request)
+    result = await run_in_threadpool(_xorics_cmd_local)
+    return result
+
+
+# POST /v1/commands/reset
+@app.post("/v1/commands/reset")
+async def cmd_reset(request: Request):
+    _auth(request)
+    result = await run_in_threadpool(_xorics_cmd_reset)
+    return result
+
+
+# POST /v1/commands/cancel
+@app.post("/v1/commands/cancel")
+async def cmd_cancel(request: Request):
+    _auth(request)
+    result = await run_in_threadpool(_xorics_cmd_cancel)
+    return result
+
+
+# POST /v1/commands/grants
+@app.post("/v1/commands/grants")
+async def cmd_grants(request: Request):
+    _auth(request)
+    result = await run_in_threadpool(_xorics_cmd_grants)
+    return result
+
+
+# POST /v1/commands/grant
+@app.post("/v1/commands/grant")
+async def cmd_grant(request: Request):
+    _auth(request)
+    body = await request.json()
+    tool = body.get("tool", "")
+    result = await run_in_threadpool(_xorics_cmd_grant, tool)
+    return result
+
+
+# POST /v1/commands/revoke
+@app.post("/v1/commands/revoke")
+async def cmd_revoke(request: Request):
+    _auth(request)
+    body = await request.json()
+    tool = body.get("tool", "")
+    result = await run_in_threadpool(_xorics_cmd_revoke, tool)
+    return result
+
+
+# POST /v1/commands/promote
+@app.post("/v1/commands/promote")
+async def cmd_promote(request: Request):
+    _auth(request)
+    body = await request.json()
+    message = body.get("message") if isinstance(body, dict) else None
+    push = bool(body.get("push")) if isinstance(body, dict) else False
+    result = await run_in_threadpool(_xorics_cmd_promote, message, push)
+    return result
+
+
+# POST /v1/commands/discard
+@app.post("/v1/commands/discard")
+async def cmd_discard(request: Request):
+    _auth(request)
+    result = await run_in_threadpool(_xorics_cmd_discard)
+    return result
+
+
+# GET /v1/commands/status
+@app.get("/v1/commands/status")
+async def cmd_status(request: Request):
+    _auth(request)
+    result = await run_in_threadpool(_xorics_cmd_status)
+    return result
 
 
 # --- operator restart all services -------------------------------------------

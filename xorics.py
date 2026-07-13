@@ -2403,7 +2403,7 @@ if __name__ == "__main__":
         sys.exit()
 
     print(f"{NAME} — local AI. The manager delegates coding to the coder automatically.")
-    print("commands: /code (coder)  /selfedit (edit Xorics, sandbox-verified; /power first → drive on M3)  /orchestrate (plan + run multi-brick goal; /power for M3 planner)  /design (plan one change, read-only)  /build (run /selfedit on the last /design spec)  /plan (break a feature into small bricks; /power for M3)  /promote /discard (approve or drop a self-edit)  /grant /revoke /grants (privileged tool permissions)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
+    print("commands: /code (coder)  /skill [/skill <query>] (list or search skills)  /capabilities (self-knowledge)  /selfedit (edit Xorics, sandbox-verified; /power first → drive on M3)  /orchestrate (plan + run multi-brick goal; /power for M3 planner)  /design (plan one change, read-only)  /build (run /selfedit on the last /design spec)  /plan (break a feature into small bricks; /power for M3)  /promote /discard (approve or drop a self-edit)  /grant /revoke /grants (privileged tool permissions)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
     print(f"coder pauses every {CHECKPOINT_EVERY} steps to check in (no cap); backstop {CODER_BACKSTOP} when unattended.\n")
     if _CHAT_HISTORY:
         print(f"(resumed {len(_CHAT_HISTORY)} remembered messages — /reset to start fresh)\n")
@@ -2493,6 +2493,28 @@ if __name__ == "__main__":
             elif q == "/build" or q.startswith("/build "):   # XORICS-FEATURE: design-mode
                 driver = MINIMAX if BRAIN == MINIMAX else CODER
                 print(f"\n{NAME.lower()}>", run_build(brain=driver), "\n")
+                continue
+            elif q == "/skill" or q.startswith("/skill "):   # XORICS-FEATURE: skill-write-on-success
+                query = q[6:].strip()
+                if query:
+                    found = skills.search_skills(query)
+                    if found:
+                        for s in found:
+                            print(f"[score={s['score']:.1f}] {s['title']}  (when: {s['trigger']})")
+                    else:
+                        print("(no matching skills — try a less specific query)")
+                else:
+                    all_skills = skills.list_skills()
+                    if all_skills:
+                        for s in all_skills:
+                            print(f"{s['title']}  [{s['domain'] or 'general'}]  (when: {s['trigger']})")
+                    else:
+                        print("(no skills yet — after a verified success, Xorics saves the approach)")
+                print()
+                continue
+            elif q == "/capabilities":   # XORICS-FEATURE: self-knowledge
+                print(capabilities.self_knowledge())
+                print()
                 continue
             elif q == "/design" or q.startswith("/design "):   # XORICS-FEATURE: design-mode
                 goal = q[7:].strip()

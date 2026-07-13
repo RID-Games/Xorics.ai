@@ -6,32 +6,48 @@ import android.os.Bundle
 import android.os.SystemClock
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowForward
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Menu
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationDrawerItem
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
@@ -45,12 +61,10 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -141,7 +155,7 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
     var sending by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("connecting…") }
     var chatId by remember { mutableStateOf<String?>(null) }
-    var menuOpen by remember { mutableStateOf(false) }
+    var drawerOpen by remember { mutableStateOf(false) }
     var chats by remember { mutableStateOf<List<Bridge.ChatMeta>>(emptyList()) }
     var watcherJob by remember { mutableStateOf<Job?>(null) }
     val listState = rememberLazyListState()
@@ -387,38 +401,128 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
         }
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Xorics") },
-                actions = {
-                    IconButton(onClick = { menuOpen = true; scope.launch { chats = withContext(Dispatchers.IO) { try { Bridge.listChats() } catch (_: Exception) { emptyList() } } } }) {
-                        Icon(Icons.Default.Menu, contentDescription = "Menu")
-                    }
-                    DropdownMenu(
-                        expanded = menuOpen,
-                        onDismissRequest = { menuOpen = false }
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text("New chat") },
-                            onClick = {
-                                menuOpen = false
-                                watcherJob?.cancel()
-                                scope.launch {
-                                    val newId = withContext(Dispatchers.IO) { Bridge.createChat() }
-                                    context.getSharedPreferences("xorics", Context.MODE_PRIVATE).edit().putString("chatId", newId).apply()
-                                    chatId = newId
-                                    messages.clear()
-                                    status = ""
+    Box(modifier = Modifier.fillMaxSize()) {
+        // Main content
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = { Text("Xorics") },
+                    actions = {
+                        IconButton(onClick = {
+                            drawerOpen = true
+                            scope.launch {
+                                chats = withContext(Dispatchers.IO) {
+                                    try { Bridge.listChats() } catch (_: Exception) { emptyList() }
                                 }
                             }
-                        )
-                        HorizontalDivider()
-                        chats.forEach { c ->
-                            DropdownMenuItem(
-                                text = { Text(c.title.ifBlank { "Untitled chat" }) },
+                        }) {
+                            Icon(Icons.Default.Menu, contentDescription = "Menu")
+                        }
+                    }
+                )
+            }
+        ) { pad ->
+            // Keyboard rider (2026-07-09): pairs with android:windowSoftInputMode="adjustResize"
+            // on this activity. Resize stops the system panning the whole window (which shoved
+            // the TopAppBar off-screen); imePadding() consumes the IME inset so the input bar
+            // rides above the keyboard instead of being covered by it.
+            Column(Modifier.fillMaxSize().padding(pad).imePadding()) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    contentPadding = PaddingValues(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(messages) { m -> MessageBubble(m) }
+                }
+                if (status.isNotEmpty()) {
+                    Text(
+                        status,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                    )
+                }
+                ChatToolbar(
+                    currentMode = currentMode,
+                    onModeChange = { currentMode = it },
+                )
+                InputBar(
+                    value = input,
+                    onValue = { input = it },
+                    onSend = { send() },
+                    enabled = !sending && chatId != null,
+                )
+            }
+        }
+
+        // Scrim overlay (semi-transparent background behind the drawer)
+        AnimatedVisibility(
+            visible = drawerOpen,
+            enter = fadeIn(),
+            exit = fadeOut()
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer { alpha = 0.5f }
+                    .clickable { drawerOpen = false }
+            )
+        }
+
+        // Right-side drawer
+        AnimatedVisibility(
+            visible = drawerOpen,
+            enter = slideInHorizontally(initialOffsetX = { it }) { width -> width },
+            exit = slideOutHorizontally(targetOffsetX = { it }) { width -> width }
+        ) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .width(300.dp)
+                    .align(Alignment.TopEnd),
+                shadowElevation = 8.dp,
+                color = MaterialTheme.colorScheme.surface
+            ) {
+                Column(modifier = Modifier.fillMaxSize()) {
+                    // Header
+                    Text(
+                        "Chats",
+                        style = MaterialTheme.typography.titleLarge,
+                        modifier = Modifier.padding(16.dp)
+                    )
+                    HorizontalDivider()
+
+                    // New chat button
+                    TextButton(
+                        onClick = {
+                            drawerOpen = false
+                            watcherJob?.cancel()
+                            scope.launch {
+                                val newId = withContext(Dispatchers.IO) { Bridge.createChat() }
+                                context.getSharedPreferences("xorics", Context.MODE_PRIVATE)
+                                    .edit().putString("chatId", newId).apply()
+                                chatId = newId
+                                messages.clear()
+                                status = ""
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("+ New chat")
+                    }
+                    HorizontalDivider()
+
+                    // Chat list
+                    chats.forEach { c ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            TextButton(
                                 onClick = {
-                                    menuOpen = false
+                                    drawerOpen = false
                                     watcherJob?.cancel()
                                     context.getSharedPreferences("xorics", Context.MODE_PRIVATE)
                                         .edit().putString("chatId", c.id).apply()
@@ -439,111 +543,112 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
                                         }
                                     }
                                 },
-                                trailingIcon = {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        // Move icon — opens folder picker
-                                        IconButton(
-                                            onClick = {
-                                                menuOpen = false
-                                                scope.launch {
-                                                    allFolders = withContext(Dispatchers.IO) { Bridge.listFolders() }
-                                                    moveDest = c.folder
-                                                    moveTarget = c
-                                                }
-                                            }
-                                        ) {
-                                            Icon(
-                                                Icons.Default.ArrowForward,
-                                                contentDescription = "Move chat",
-                                                tint = MaterialTheme.colorScheme.onSurfaceVariant
-                                            )
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(
+                                    c.title.ifBlank { "Untitled chat" },
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    color = if (c.id == chatId) MaterialTheme.colorScheme.primary
+                                            else MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                            // Move icon
+                            IconButton(
+                                onClick = {
+                                    scope.launch {
+                                        allFolders = withContext(Dispatchers.IO) { Bridge.listFolders() }
+                                        moveDest = c.folder
+                                        moveTarget = c
+                                    }
+                                }
+                            ) {
+                                Icon(
+                                    Icons.Default.ArrowForward,
+                                    contentDescription = "Move chat",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            // Delete icon
+                            IconButton(
+                                onClick = {
+                                    scope.launch {
+                                        withContext(Dispatchers.IO) { Bridge.deleteChat(c.id) }
+                                        chats = withContext(Dispatchers.IO) {
+                                            try { Bridge.listChats() } catch (_: Exception) { emptyList() }
                                         }
-                                        // Delete icon
-                                        IconButton(
-                                            onClick = {
-                                                scope.launch {
-                                                    withContext(Dispatchers.IO) { Bridge.deleteChat(c.id) }
-                                                    chats = withContext(Dispatchers.IO) {
-                                                        try { Bridge.listChats() } catch (_: Exception) { emptyList() }
-                                                    }
-                                                    if (chatId == c.id) {
-                                                        val first = chats.firstOrNull()
-                                                        if (first != null) {
-                                                            context.getSharedPreferences("xorics", Context.MODE_PRIVATE)
-                                                                .edit().putString("chatId", first.id).apply()
-                                                            chatId = first.id
-                                                            messages.clear()
-                                                            status = ""
-                                                        } else {
-                                                            val newId = withContext(Dispatchers.IO) { Bridge.createChat() }
-                                                            context.getSharedPreferences("xorics", Context.MODE_PRIVATE)
-                                                                .edit().putString("chatId", newId).apply()
-                                                            chatId = newId
-                                                            messages.clear()
-                                                            status = ""
-                                                        }
-                                                    }
-                                                }
+                                        if (chatId == c.id) {
+                                            val first = chats.firstOrNull()
+                                            if (first != null) {
+                                                context.getSharedPreferences("xorics", Context.MODE_PRIVATE)
+                                                    .edit().putString("chatId", first.id).apply()
+                                                chatId = first.id
+                                                messages.clear()
+                                                status = ""
+                                            } else {
+                                                val newId = withContext(Dispatchers.IO) { Bridge.createChat() }
+                                                context.getSharedPreferences("xorics", Context.MODE_PRIVATE)
+                                                    .edit().putString("chatId", newId).apply()
+                                                chatId = newId
+                                                messages.clear()
+                                                status = ""
                                             }
-                                        ) {
-                                            Icon(Icons.Default.Delete, contentDescription = "Delete chat", tint = MaterialTheme.colorScheme.error)
                                         }
                                     }
                                 }
-                            )
+                            ) {
+                                Icon(
+                                    Icons.Default.Delete,
+                                    contentDescription = "Delete chat",
+                                    tint = MaterialTheme.colorScheme.error
+                                )
+                            }
                         }
-                        if (chats.isNotEmpty()) HorizontalDivider()
-                        DropdownMenuItem(
-                            text = { Text("Edits") },
-                            onClick = { menuOpen = false; showEdits = true; refreshEdits() }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Grants") },
-                            onClick = { menuOpen = false; permHint = null; showPerms = true; refreshPerms() }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Files") },
-                            onClick = { menuOpen = false; onOpenFiles() }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Voice") },
-                            onClick = { menuOpen = false; onOpenVoice() }
-                        )
                     }
+
+                    // Navigation items at bottom
+                    HorizontalDivider()
+                    NavigationDrawerItem(
+                        label = { Text("Edits") },
+                        selected = false,
+                        onClick = {
+                            drawerOpen = false
+                            showEdits = true
+                            refreshEdits()
+                        },
+                        icon = { Icon(Icons.Default.Edit, contentDescription = null) }
+                    )
+                    NavigationDrawerItem(
+                        label = { Text("Grants") },
+                        selected = false,
+                        onClick = {
+                            drawerOpen = false
+                            permHint = null
+                            showPerms = true
+                            refreshPerms()
+                        },
+                        icon = { Icon(Icons.Default.Key, contentDescription = null) }
+                    )
+                    NavigationDrawerItem(
+                        label = { Text("Files") },
+                        selected = false,
+                        onClick = {
+                            drawerOpen = false
+                            onOpenFiles()
+                        },
+                        icon = { Icon(Icons.Default.Folder, contentDescription = null) }
+                    )
+                    NavigationDrawerItem(
+                        label = { Text("Voice") },
+                        selected = false,
+                        onClick = {
+                            drawerOpen = false
+                            onOpenVoice()
+                        },
+                        icon = { Icon(Icons.Default.Mic, contentDescription = null) }
+                    )
                 }
-            )
-        }
-    ) { pad ->
-        // Keyboard rider (2026-07-09): pairs with android:windowSoftInputMode="adjustResize"
-        // on this activity. Resize stops the system panning the whole window (which shoved
-        // the TopAppBar off-screen); imePadding() consumes the IME inset so the input bar
-        // rides above the keyboard instead of being covered by it.
-        Column(Modifier.fillMaxSize().padding(pad).imePadding()) {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.weight(1f).fillMaxWidth(),
-                contentPadding = PaddingValues(12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                items(messages) { m -> MessageBubble(m) }
             }
-            if (status.isNotEmpty()) {
-                Text(
-                    status,
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
-                )
-            }
-            ChatToolbar(
-                currentMode = currentMode,
-                onModeChange = { currentMode = it },
-            )
-            InputBar(
-                value = input,
-                onValue = { input = it },
-                onSend = { send() },
-                enabled = !sending && chatId != null,
-            )
         }
     }
 
