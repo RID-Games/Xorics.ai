@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Xorics — OpenAI-compatible chat bridge + voice surface.
+# Xorics - OpenAI-compatible chat bridge + voice surface.
 # Copyright (C) 2026 Zawayix
 #
 # This file is part of Xorics, free software under the GNU AGPL v3 or later.
@@ -19,7 +19,7 @@ Phone voice flow (the page orchestrates): mic -> /stt -> /v1/chat/completions ->
 whisper was built without --convert, so /stt MUST resample to 16kHz mono first; that same
 ffmpeg step also turns the browser's webm/opus into something whisper accepts.
 
-Run (from ~/xorics-ai, venv active; no new pip installs needed — httpx ships with openai):
+Run (from ~/xorics-ai, venv active; no new pip installs needed - httpx ships with openai):
     uvicorn bridge:app --host 127.0.0.1 --port 8090
 Already exposed via `tailscale serve --bg 8090`, so the page is at
     https://ridgames.<tailnet>.ts.net/
@@ -37,6 +37,9 @@ import time
 import uuid
 import base64
 import threading
+_ASK_LOCK  = threading.Lock()
+_LAST_ASK  = {"text": None, "ts": None}
+_ASK_LOG   = "/tmp/xorics_ask.log"
 import tempfile
 import subprocess
 
@@ -45,32 +48,65 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from starlette.concurrency import run_in_threadpool
 
-import xorics   # pulls in the whole assistant; the REPL is __main__-guarded, so import is safe
+# import xorics   # REMOVED. Hermes now handles it.
+_ASK_LOCK  = __import__("threading").Lock()
+_AST_LOCK_USED = True
+
 from api import make_router   # app-facing REST API (projects/chats/messages); see api.py
 from glasses_bus import make_glasses_router   # G2 glasses command/event bus; see glasses_bus.py
 from dashboard_router import make_dashboard_router   # glasses HUD dashboard pages; see dashboard_router.py
 
-# --- one-time setup ----------------------------------------------------------
-xorics.BRAIN = xorics.MANAGER   # glasses/phone talk to the manager; it routes to the coder itself
+# import xorics   # REMOVED - Hermes now handles it
+# --- Hermes bridge (replaces xorics) ---------------------------------------------
+import os, pty, select, queue, threading, re
 
-# Continue the saved conversation instead of clobbering it (no-op without the memory layer).
-if hasattr(xorics, "_CHAT_HISTORY") and hasattr(xorics, "_load_history"):
-    xorics._CHAT_HISTORY[:] = xorics._load_history()
+HERMES_BIN      = os.environ.get("HERMES_BIN", os.path.expanduser("~/xorics-ai/venv/bin/hermes"))
+_BRIDGE_SESSION = "xorics-bridge"
+_BRIDGE_MODEL   = os.environ.get("XORICS_BRIDGE_MODEL", "gpt-oss")
 
-_ASK_LOCK = threading.Lock()    # ask() drives one global brain over llama-swap — serialize
-_LAST_ASK = {"text": None, "ts": None}  # last ask through THIS process — xorics.ask() is stateless
-_ASK_LOG = "/tmp/xorics_ask.log"   # trace every ask/response for debugging silent failures
+_BRIDGE_LOCK    = threading.Lock()
+_BRIDGE_OUT     = queue.Queue()
+_BRIDGE_PROC    = None
+_BRIDGE_MASTER  = None
+_BRIDGE_RUNNING = False
+_BRIDGE_HISTORY = []
+
+
+def _bridge_ask(text: str, history: list = None) -> str:
+    """Call llama-swap (local GPU model) directly via OpenAI-compatible API."""
+    from openai import OpenAI
+    client = OpenAI(base_url="http://127.0.0.1:9090/v1", api_key="not-needed")
+
+    messages = []
+    if history:
+        for msg in history:
+            if isinstance(msg, dict):
+                messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+            else:
+                messages.append({"role": msg[0], "content": msg[1]})
+    messages.append({"role": "user", "content": text})
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-oss",
+            messages=messages,
+            max_tokens=2048,
+            temperature=0.7,
+            timeout=120,
+        )
+        return resp.choices[0].message.content or ""
+    except Exception as e:
+        return f"[error: {e}]"
+
 
 def _log_ask(prompt_preview, response_preview, history_len):
-    """Append a one-line trace of every ask/response to _ASK_LOG for debugging silent failures."""
     ts = time.strftime("%H:%M:%S")
     try:
         with open(_ASK_LOG, "a") as f:
             f.write(f"[{ts}] hist={history_len} prompt={prompt_preview!r} response={response_preview!r}\n")
     except OSError:
         pass
-                                        # by contract, so the dashboard agent page reads this, not
-                                        # xorics._CHAT_HISTORY (which never updates on bridge asks).
+
 _TOKEN = os.environ.get("XORICS_BRIDGE_TOKEN")
 
 WHISPER_URL = os.environ.get("XORICS_WHISPER_URL", "http://127.0.0.1:8084/inference")
@@ -121,30 +157,15 @@ def _completion(text, model):
 
 
 def _run_ask(text, history=None):
-    # One ask() at a time. A delegate_to_coder run is minutes + two GPU swaps — fine over
-    # the phone (it waits), but the glasses/Even Hub will time out on those.
     with _ASK_LOCK:
-        _LAST_ASK.update(text=text, ts=time.time())   # dashboard agent page (see _LAST_ASK above)
-        return str(xorics.ask(text, history=history))
-
-
+        _LAST_ASK.update(text=text, ts=time.time())
+        return str(_bridge_ask(text, history=history))
 def _run_ask_full(text, history=None):
-    # Like _run_ask, but ALSO returns the deliverables the coder verified to disk THIS turn, so the
-    # caller (api.py) can mirror them into the project file store and the app can actually see them.
-    # built_path stays for back-compat, but it's the MANAGER's path and is ~always None on a delegated
-    # build — the reliable source is the honesty-ledger diff, taken here INSIDE the lock (so a
-    # concurrent turn can't muddy the before/after) around this one ask() call. XORICS-FEATURE: deliverables-to-store
     with _ASK_LOCK:
-        _LAST_ASK.update(text=text, ts=time.time())   # dashboard agent page (see _LAST_ASK above)
-        _deliv_before = len(xorics._load_deliverables())
-        r = xorics.ask(text, history=history)
-        text_r = str(r)
+        _LAST_ASK.update(text=text, ts=time.time())
+        text_r = _bridge_ask(text, history=history)
         _log_ask(text[:80], text_r[:200], len(history) if history else 0)
-        fresh = [d["path"] for d in xorics._load_deliverables()[_deliv_before:]
-                 if os.path.exists(os.path.expanduser(d["path"]))]
-        return text_r, getattr(r, "built_path", None), fresh
-
-
+        return text_r, None, []
 async def _chat(request: Request):
     _auth(request)
     body = await request.json()
@@ -317,12 +338,12 @@ async def upload(request: Request):
 
 
 # --- chat routes + aux -------------------------------------------------------
-# G2 POSTs to whatever path you set as the Agent URL — canonical path and bare root both work.
+# G2 POSTs to whatever path you set as the Agent URL - canonical path and bare root both work.
 app.post("/v1/chat/completions")(_chat)
 app.post("/")(_chat)
 
 # App-facing API: projects / chats / messages, persisted + memory-backed (api.py).
-# Additive — the OpenAI route above is untouched, so the glasses/Even Hub keep working.
+# Additive - the OpenAI route above is untouched, so the glasses/Even Hub keep working.
 app.include_router(make_router(_run_ask_full, _auth))
 
 # G2 base system bus: Xorics plugins enqueue commands, the RID app long-polls them
@@ -333,7 +354,7 @@ app.include_router(make_glasses_router(_auth))
 # same-origin Vite proxy (:5174 /page/* -> /dashboard/*). Additive; see dashboard_router.py.
 app.include_router(make_dashboard_router(_auth,
                                          busy=_ASK_LOCK.locked,          # live: an ask() holds it
-                                         last_ask=lambda: dict(_LAST_ASK)))  # copy — no shared mutation
+                                         last_ask=lambda: dict(_LAST_ASK)))  # copy - no shared mutation
 
 
 @app.get("/healthz")
