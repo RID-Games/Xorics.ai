@@ -882,7 +882,7 @@ FIRMWARE_TOOLS = [t for t in TOOLS if t["function"]["name"]
 # NARROW — none of the PCB / firmware / build tools — so a self-edit delegation can only read and
 # propose-verified-write, nothing else (the firmware-gate pattern, applied to self-edit).
 # XORICS-FEATURE: self-edit
-SELF_EDIT_TOOLS = [t for t in TOOLS if t["function"]["name"] in ("read_file", "write_file", "str_replace")]
+SELF_EDIT_TOOLS = [t for t in TOOLS if t["function"]["name"] in ("read_file", "write_file", "str_replace", "delegate_to_coder")]
 
 # Planning-only toolset: the planner proposing what an Xorics change should look like, BEFORE
 # any /selfedit run. read_file only — no write_file, no sandbox, no build tools. The planner
