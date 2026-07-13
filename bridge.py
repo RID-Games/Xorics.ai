@@ -33,6 +33,7 @@ Config (env, all optional):
 """
 
 import os
+import sys
 import time
 import uuid
 import base64
@@ -43,7 +44,12 @@ _ASK_LOG   = "/tmp/xorics_ask.log"
 import tempfile
 import subprocess
 
+# Add local dir to path so we can import skills and capabilities
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import httpx
+import skills
+import capabilities
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from starlette.concurrency import run_in_threadpool
@@ -365,6 +371,18 @@ async def healthz():
 @app.get("/v1/models")
 async def models():
     return {"object": "list", "data": [{"id": "xorics", "object": "model", "owned_by": "rid"}]}
+
+
+@app.get("/v1/skills")
+async def list_skills(request: Request):
+    _auth(request)
+    return {"skills": skills.list_skills()}
+
+
+@app.get("/v1/capabilities")
+async def list_capabilities(request: Request):
+    _auth(request)
+    return {"capabilities": capabilities.self_knowledge()}
 
 
 # --- permission surface ------------------------------------------------------
