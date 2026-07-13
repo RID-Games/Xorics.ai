@@ -2403,7 +2403,7 @@ if __name__ == "__main__":
         sys.exit()
 
     print(f"{NAME} — local AI. The manager delegates coding to the coder automatically.")
-    print("commands: /code (coder)  /skill [/skill <query>] (list or search skills)  /capabilities (self-knowledge)  /selfedit (edit Xorics, sandbox-verified; /power first → drive on M3)  /orchestrate (plan + run multi-brick goal; /power for M3 planner)  /design (plan one change, read-only)  /build (run /selfedit on the last /design spec)  /plan (break a feature into small bricks; /power for M3)  /promote /discard (approve or drop a self-edit)  /grant /revoke /grants (privileged tool permissions)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
+    print("commands: /code (coder)  /selfedit (edit Xorics, sandbox-verified; /power first → drive on M3)  /orchestrate (plan + run multi-brick goal; /power for M3 planner)  /design (plan one change, read-only)  /build (run /selfedit on the last /design spec)  /plan (break a feature into small bricks; /power for M3)  /promote /discard (approve or drop a self-edit)  /grant /revoke /grants (privileged tool permissions)  /chat or /local (gpt-oss manager)  /power (MiniMax M3 manager)  /reset  Ctrl+C quit")
     print(f"coder pauses every {CHECKPOINT_EVERY} steps to check in (no cap); backstop {CODER_BACKSTOP} when unattended.\n")
     if _CHAT_HISTORY:
         print(f"(resumed {len(_CHAT_HISTORY)} remembered messages — /reset to start fresh)\n")
@@ -2418,57 +2418,17 @@ if __name__ == "__main__":
             q = input(f"you[{tag}]> ").strip()
             if not q:
                 continue
-            if q == "/code" or q.startswith("/code "):   # XORICS-FEATURE: coder-control
-                BRAIN = CODER; PLAN_MODE = False; print("→ manual coding mode (driving qwen3-coder directly)\n")
-                q = q[5:].strip()
-                if not q:
-                    continue
-            elif q == "/chat" or q.startswith("/chat "):
-                BRAIN = MANAGER; PLAN_MODE = False; print("→ manager mode (gpt-oss; delegates coding)\n")
-                q = q[5:].strip()
-                if not q:
-                    continue
-            elif q == "/power" or q.startswith("/power "):   # XORICS-FEATURE: power-mode
-                if os.environ.get("MINIMAX_API_KEY"):
-                    BRAIN = MINIMAX
-                    print(f"→ POWER mode (manager = {MINIMAX}, remote; coder stays local on {CODER})\n")
-                else:
-                    print("✗ MINIMAX_API_KEY not set — export it (and set a spend cap) first. Staying put.\n")
-                q = q[6:].strip()
-                if not q:
-                    continue
-            elif q == "/local" or q.startswith("/local "):   # brain off-switch for /power (keeps /plan; /chat fully exits)
-                BRAIN = MANAGER; print(f"→ local manager mode ({MANAGER})\n")
-                q = q[6:].strip()
-                if not q:
-                    continue
-            elif q == "/reset" or q == "/new":
-                reset_history()
-                # Also exit any ongoing self-edit session (module-level names, no 'global' needed).
-                xorics._SELFEDIT_ACTIVE = False
-                xorics._SELFEDIT_MESSAGES = []
-                xorics._SELFEDIT_BRAIN = xorics.CODER
-                print("→ conversation cleared — fresh context\n")
-                continue
-            elif q == "/cancel":                                # XORICS-FEATURE: self-edit
-                if not xorics._SELFEDIT_ACTIVE:
-                    print("not in a self-edit session.\n")
-                else:
-                    xorics._SELFEDIT_ACTIVE = False
-                    xorics._SELFEDIT_MESSAGES = []
-                    xorics._SELFEDIT_BRAIN = xorics.CODER
-                    print("self-edit session paused. Use /promote or /discard to resolve "
-                          "the staged change, or /selfedit <task> to start a new one.\n")
-                continue
-            # If a self-edit session is active, feed all input back into it so the
-            # model sees the full conversation instead of cold-starting from scratch.
-            # XORICS-FEATURE: self-edit (continuation)
-            elif xorics._SELFEDIT_ACTIVE:
-                ans = xorics.run_self_edit(task=q, brain=xorics._SELFEDIT_BRAIN,
-                                          messages=xorics._SELFEDIT_MESSAGES)
-                print(f"\n{NAME.lower()}>", ans, "\n")
-                continue
-            elif q == "/selfedit" or q.startswith("/selfedit "):   # XORICS-FEATURE: self-edit
+
+            # ================================================================
+            # COMMAND HANDLERS — handle and return. Brain switches
+            # (/chat, /power, /local, /code) always fall through so their
+            # stripped message goes to the new brain.  This ordering
+            # matches ask() in bridge.py and is what makes "/power /selfedit foo"
+            # correctly route to MiniMax.
+            # ================================================================
+
+            # /selfedit — sandbox-verified self-edit (uses current BRAIN, so /power works)
+            if q == "/selfedit" or q.startswith("/selfedit "):   # XORICS-FEATURE: self-edit
                 task = q[9:].strip()
                 if not task:
                     print("usage: /selfedit <what to change in Xorics's own code>  "
@@ -2476,61 +2436,14 @@ if __name__ == "__main__":
                     continue
                 driver = MINIMAX if BRAIN == MINIMAX else CODER   # XORICS-FEATURE: power-mode
                 where = "MiniMax M3, remote" if driver == MINIMAX else f"{driver}, local"
-                print(f"→ self-edit mode (driver: {where}; every write is sandbox-verified, the live "
+                print(f"\u2192 self-edit mode (driver: {where}; every write is sandbox-verified, the live "
                       "tree untouched until you approve)\n")
                 ans = run_self_edit(task, brain=driver)
                 print(f"\n{NAME.lower()}>", ans, "\n")
                 continue
-            elif q == "/plan" or q.startswith("/plan "):   # XORICS-FEATURE: plan-mode
-                PLAN_MODE = True
-                where = "MiniMax M3, remote" if BRAIN == MINIMAX else f"{BRAIN}, local"
-                print(f"→ planning mode (partner: {where}; read-only — breaks a feature into small, "
-                      "shippable bricks and walks you through building them one at a time. "
-                      "/power for M3's stronger breakdown; /chat to exit)\n")
-                q = q[5:].strip()
-                if not q:
-                    continue
-            elif q == "/build" or q.startswith("/build "):   # XORICS-FEATURE: design-mode
-                driver = MINIMAX if BRAIN == MINIMAX else CODER
-                print(f"\n{NAME.lower()}>", run_build(brain=driver), "\n")
-                continue
-            elif q == "/skill" or q.startswith("/skill "):   # XORICS-FEATURE: skill-write-on-success
-                query = q[6:].strip()
-                if query:
-                    found = skills.search_skills(query)
-                    if found:
-                        for s in found:
-                            print(f"[score={s['score']:.1f}] {s['title']}  (when: {s['trigger']})")
-                    else:
-                        print("(no matching skills — try a less specific query)")
-                else:
-                    all_skills = skills.list_skills()
-                    if all_skills:
-                        for s in all_skills:
-                            print(f"{s['title']}  [{s['domain'] or 'general'}]  (when: {s['trigger']})")
-                    else:
-                        print("(no skills yet — after a verified success, Xorics saves the approach)")
-                print()
-                continue
-            elif q == "/capabilities":   # XORICS-FEATURE: self-knowledge
-                print(capabilities.self_knowledge())
-                print()
-                continue
-            elif q == "/design" or q.startswith("/design "):   # XORICS-FEATURE: design-mode
-                goal = q[7:].strip()
-                if not goal:
-                    print("usage: /design <what to plan in Xorics's own code>  "
-                          "(read-only: prints a PLAN + one-line self-edit spec, makes no edits; "
-                          "run /power first to plan on MiniMax M3)\n")
-                    continue
-                driver = MINIMAX if BRAIN == MINIMAX else MANAGER   # planning brain, not the coder
-                where = "MiniMax M3, remote" if driver == MINIMAX else f"{driver}, local"
-                print(f"→ design mode (planner: {where}; planning only — reads source files and "
-                      "prints a PLAN + self-edit spec, makes NO edits and stops)\n")
-                ans = run_design(goal, brain=driver)
-                print(f"\n{NAME.lower()}>", ans, "\n")
-                continue
-            elif q == "/orchestrate" or q.startswith("/orchestrate "):   # XORICS-FEATURE: orchestrate
+
+            # /orchestrate — plan + run multi-brick goal with auto-promote
+            if q == "/orchestrate" or q.startswith("/orchestrate "):   # XORICS-FEATURE: orchestrate
                 goal = q[12:].strip()
                 if not goal:
                     print("usage: /orchestrate <goal>  "
@@ -2539,30 +2452,45 @@ if __name__ == "__main__":
                     continue
                 driver = MINIMAX if BRAIN == MINIMAX else MANAGER   # planning brain, not the coder
                 where = "MiniMax M3, remote" if driver == MINIMAX else f"{driver}, local"
-                print(f"→ orchestrate mode (planner: {where}; coder: {CODER}, local)\n")
+                print(f"\u2192 orchestrate mode (planner: {where}; coder: {CODER}, local)\n")
                 ans = run_orchestrate(goal, brain=driver)
                 print(f"\n{NAME.lower()}>", ans, "\n")
                 continue
-            elif q == "/grants":     # XORICS-FEATURE: tool-permissions
-                print("privileged: " + ", ".join(sorted(_PRIVILEGED_TOOLS)))
-                granted = ", ".join(sorted(_TOOL_GRANTS)) if _TOOL_GRANTS else "(none — deny-all)"
-                print("granted: " + granted)
-                print()
+
+            # /plan — read-only planning, breaks a goal into bricks (/power for M3)
+            if q == "/plan" or q.startswith("/plan "):   # XORICS-FEATURE: plan-mode
+                PLAN_MODE = True
+                where = "MiniMax M3, remote" if BRAIN == MINIMAX else f"{BRAIN}, local"
+                print(f"\u2192 planning mode (partner: {where}; read-only \u2014 breaks a feature into small, "
+                      "shippable bricks and walks you through building them one at a time. "
+                      "/power for M3's stronger breakdown; /chat to exit)\n")
+                q = q[5:].strip()
+                if not q:
+                    continue
+
+            # /design — read-only design, prints plan + spec (no edits)
+            if q == "/design" or q.startswith("/design "):   # XORICS-FEATURE: design-mode
+                goal = q[7:].strip()
+                if not goal:
+                    print("usage: /design <what to plan in Xorics's own code>  "
+                          "(read-only: prints a PLAN + one-line self-edit spec, makes no edits; "
+                          "run /power first to plan on MiniMax M3)\n")
+                    continue
+                driver = MINIMAX if BRAIN == MINIMAX else MANAGER   # planning brain, not the coder
+                where = "MiniMax M3, remote" if driver == MINIMAX else f"{driver}, local"
+                print(f"\u2192 design mode (planner: {where}; planning only \u2014 reads source files and "
+                      "prints a PLAN + self-edit spec, makes NO edits and stops)\n")
+                ans = run_design(goal, brain=driver)
+                print(f"\n{NAME.lower()}>", ans, "\n")
                 continue
-            elif q.startswith("/grant "):   # XORICS-FEATURE: tool-permissions
-                t = q[7:].strip()
-                if _grant_tool(t):
-                    print(f"granted: {t} (revoke with /revoke {t})")
-                else:
-                    print(f"refused: {t} is not a privileged tool — grantable: "
-                          + ", ".join(sorted(_PRIVILEGED_TOOLS)))
-                print()
+
+            # /build — run /selfedit on the last /design spec
+            if q == "/build" or q.startswith("/build "):   # XORICS-FEATURE: design-mode
+                driver = MINIMAX if BRAIN == MINIMAX else CODER
+                print(f"\n{NAME.lower()}>", run_build(brain=driver), "\n")
                 continue
-            elif q.startswith("/revoke "):   # XORICS-FEATURE: tool-permissions
-                t = q[8:].strip()
-                print(f"revoked: {t}" if _revoke_tool(t) else f"{t} was not granted")
-                print()
-                continue
+
+            # /promote — approve and commit the staged self-edit
             elif q == "/promote" or q.startswith("/promote "):   # XORICS-FEATURE: self-edit (approval gate)
                 msg = q[8:].strip() or None
                 rels, diff, task = review_self_edit()
@@ -2576,15 +2504,106 @@ if __name__ == "__main__":
                 if ok != "y":
                     print("not promoted (left staged; /discard to drop it).\n")
                     continue
-                print("re-verifying before applying…")
+                print("re-verifying before applying\u2026")
                 print(promote_self_edit(msg) + "\n")
                 continue
+
+            # /discard — drop the staged self-edit
             elif q == "/discard":                                # XORICS-FEATURE: self-edit
                 print(discard_self_edit() + "\n")
                 continue
+
+            # /cancel — pause the current self-edit session
+            elif q == "/cancel":                                # XORICS-FEATURE: self-edit
+                if not xorics._SELFEDIT_ACTIVE:
+                    print("not in a self-edit session.\n")
+                else:
+                    xorics._SELFEDIT_ACTIVE = False
+                    xorics._SELFEDIT_MESSAGES = []
+                    xorics._SELFEDIT_BRAIN = xorics.CODER
+                    print("self-edit session paused. Use /promote or /discard to resolve "
+                          "the staged change, or /selfedit <task> to start a new one.\n")
+                continue
+
+            # ================================================================
+            # BRAIN SWITCHES — always fall through so stripped message
+            # goes to the newly-selected brain.  This is what makes
+            # "/power design foo" work: /power sets BRAIN=MINIMAX, strips
+            # to "design foo", and the model call below dispatches it.
+            # ================================================================
+
+            if q == "/code" or q.startswith("/code "):   # XORICS-FEATURE: coder-control
+                BRAIN = CODER; PLAN_MODE = False; print("\u2192 manual coding mode (driving qwen3-coder directly)\n")
+                q = q[5:].strip()
+                if not q:
+                    continue
+            elif q == "/chat" or q.startswith("/chat "):
+                BRAIN = MANAGER; PLAN_MODE = False; print("\u2192 manager mode (gpt-oss; delegates coding)\n")
+                q = q[5:].strip()
+                if not q:
+                    continue
+            elif q == "/power" or q.startswith("/power "):   # XORICS-FEATURE: power-mode
+                if os.environ.get("MINIMAX_API_KEY"):
+                    BRAIN = MINIMAX
+                    print(f"\u2192 POWER mode (manager = {MINIMAX}, remote; coder stays local on {CODER})\n")
+                else:
+                    print("\u2717 MINIMAX_API_KEY not set \u2014 export it (and set a spend cap) first. Staying put.\n")
+                q = q[6:].strip()
+                if not q:
+                    continue
+            elif q == "/local" or q.startswith("/local "):   # brain off-switch for /power (keeps /plan; /chat fully exits)
+                BRAIN = MANAGER; print(f"\u2192 local manager mode ({MANAGER})\n")
+                q = q[6:].strip()
+                if not q:
+                    continue
+
+            # If a self-edit session is active, feed all input back into it so the
+            # model sees the full conversation instead of cold-starting from scratch.
+            # XORICS-FEATURE: self-edit (continuation)
+            elif xorics._SELFEDIT_ACTIVE:
+                ans = xorics.run_self_edit(task=q, brain=xorics._SELFEDIT_BRAIN,
+                                          messages=xorics._SELFEDIT_MESSAGES)
+                print(f"\n{NAME.lower()}>", ans, "\n")
+                continue
+
+            elif q == "/reset" or q == "/new":
+                reset_history()
+                # Also exit any ongoing self-edit session (module-level names, no 'global' needed).
+                xorics._SELFEDIT_ACTIVE = False
+                xorics._SELFEDIT_MESSAGES = []
+                xorics._SELFEDIT_BRAIN = xorics.CODER
+                print("\u2192 conversation cleared \u2014 fresh context\n")
+                continue
+
+            elif q == "/grants":     # XORICS-FEATURE: tool-permissions
+                print("privileged: " + ", ".join(sorted(_PRIVILEGED_TOOLS)))
+                granted = ", ".join(sorted(_TOOL_GRANTS)) if _TOOL_GRANTS else "(none \u2014 deny-all)"
+                print("granted: " + granted)
+                print()
+                continue
+            elif q.startswith("/grant "):   # XORICS-FEATURE: tool-permissions
+                t = q[7:].strip()
+                if _grant_tool(t):
+                    print(f"granted: {t} (revoke with /revoke {t})")
+                else:
+                    print(f"refused: {t} is not a privileged tool \u2014 grantable: "
+                          + ", ".join(sorted(_PRIVILEGED_TOOLS)))
+                print()
+                continue
+            elif q.startswith("/revoke "):   # XORICS-FEATURE: tool-permissions
+                t = q[8:].strip()
+                print(f"revoked: {t}" if _revoke_tool(t) else f"{t} was not granted")
+                print()
+                continue
+
+            # ================================================================
+            # MODEL CALL — active brain (may have been switched above),
+            # transcript window, deliverable save.
+            # ================================================================
             # manager/power turns carry the running transcript (persisted by _remember); coder turns
             # are task-scoped, no history. ask() is stateless now, so the REPL owns this. 
             hist = None if BRAIN == CODER else _CHAT_HISTORY[-CHAT_HISTORY_MSGS:]
+
             ans = ask(q, history=hist)
             print(f"\n{NAME.lower()}>", ans, "\n")
             if BRAIN == CODER:                       # direct-drive: save the deliverable too
