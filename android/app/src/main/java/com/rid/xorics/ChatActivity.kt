@@ -32,10 +32,10 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowForward
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.Folder
-import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material.icons.filled.Menu
-import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MicNone
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -472,8 +472,8 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
         // Right-side drawer
         AnimatedVisibility(
             visible = drawerOpen,
-            enter = slideInHorizontally(initialOffsetX = { it }) { width -> width },
-            exit = slideOutHorizontally(targetOffsetX = { it }) { width -> width }
+            enter = slideInHorizontally(animationSpec = androidx.compose.animation.core.tween(300), initialOffsetX = { fullWidth -> fullWidth }),
+            exit = slideOutHorizontally(animationSpec = androidx.compose.animation.core.tween(300), targetOffsetX = { fullWidth -> fullWidth })
         ) {
             Surface(
                 modifier = Modifier
@@ -627,7 +627,7 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
                             showPerms = true
                             refreshPerms()
                         },
-                        icon = { Icon(Icons.Default.Key, contentDescription = null) }
+                        icon = { Icon(Icons.Default.VpnKey, contentDescription = null) }
                     )
                     NavigationDrawerItem(
                         label = { Text("Files") },
@@ -636,7 +636,7 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
                             drawerOpen = false
                             onOpenFiles()
                         },
-                        icon = { Icon(Icons.Default.Folder, contentDescription = null) }
+                        icon = { Icon(Icons.Default.FolderOpen, contentDescription = null) }
                     )
                     NavigationDrawerItem(
                         label = { Text("Voice") },
@@ -645,7 +645,7 @@ fun ChatScreen(onOpenVoice: () -> Unit, onOpenFiles: () -> Unit, resumeTick: Int
                             drawerOpen = false
                             onOpenVoice()
                         },
-                        icon = { Icon(Icons.Default.Mic, contentDescription = null) }
+                        icon = { Icon(Icons.Default.MicNone, contentDescription = null) }
                     )
                 }
             }
